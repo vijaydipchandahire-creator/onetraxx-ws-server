@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: onetraxx-ws-backup
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: SUPABASE_URL
+        value: https://sdshilwrjgckdncbezsi.supabase.co
+      - key: PORT
+        value: 8080
+      # Set in the Render dashboard, never commit it. sync:false keeps it secret.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
