@@ -81,9 +81,10 @@ function broadcast(room, message, exceptWs) {
 // trailing slash, or query string.
 const server = http.createServer((req, res) => {
   const isUpgrade = (req.headers.upgrade || '').toLowerCase() === 'websocket';
-  if (req.method === 'GET' && !isUpgrade) {
+  if (!isUpgrade && (req.method === 'GET' || req.method === 'HEAD')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', rooms: rooms.size, connections: allClients.size }));
+    // HEAD probes (e.g. `curl -I`, some uptime checkers) want headers only.
+    res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', rooms: rooms.size, connections: allClients.size }));
     return;
   }
   res.writeHead(404, { 'Content-Type': 'application/json' });
