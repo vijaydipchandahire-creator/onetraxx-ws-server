@@ -75,8 +75,13 @@ function broadcast(room, message, exceptWs) {
 }
 
 // ── HTTP server: health check + host for the WS upgrade ──────────────────────
+// Any plain HTTP GET is a health check. WebSocket upgrades fire the 'upgrade'
+// event (handled by ws), not this 'request' handler, so they never reach here —
+// matching on method alone is enough and survives Render probing any path,
+// trailing slash, or query string.
 const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+  const isUpgrade = (req.headers.upgrade || '').toLowerCase() === 'websocket';
+  if (req.method === 'GET' && !isUpgrade) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', rooms: rooms.size, connections: allClients.size }));
     return;
