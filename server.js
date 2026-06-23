@@ -7,6 +7,12 @@ const { URL } = require('url');
 const { WebSocketServer, WebSocket } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
+// @supabase/supabase-js builds a RealtimeClient on createClient(), which needs a
+// global WebSocket. Node < 22 has none, so expose the one from `ws`. This server
+// doesn't use Supabase Realtime (only token validation), but createClient throws
+// without this on Node 20.
+if (!globalThis.WebSocket) globalThis.WebSocket = WebSocket;
+
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
