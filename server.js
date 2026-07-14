@@ -3,9 +3,30 @@
 require('dotenv').config();
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 const { WebSocketServer, WebSocket } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+
+// Build/version metadata exposed on the health endpoint for the weekly
+// primary/backup drift check (§10.5 proposal): src_sha256 fingerprints the
+// exact deployed source, lock_sha256 the dependency lockfile (null when the
+// file is absent). Computed once at boot; a mismatch between the two servers'
+// values IS drift — the class of bug that has been caught manually 3 times.
+const BUILD_INFO = (() => {
+  const sha = (p) => {
+    try { return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'); }
+    catch (_) { return null; }
+  };
+  return {
+    src_sha256: sha(__filename),
+    lock_sha256: sha(path.join(__dirname, 'package-lock.json')),
+    node: process.version,
+    booted_at: new Date().toISOString(),
+  };
+})();
 
 // @supabase/supabase-js builds a RealtimeClient on createClient(), which needs a
 // global WebSocket. Node < 22 has none, so expose the one from `ws`. This server
@@ -197,8 +218,15 @@ async function maybeServerFinalize(roomId, room) {
   // window before we finalize on their behalf. Mirrors GPS_GRACE_MS semantics.
   setTimeout(async () => {
     const r = rooms.get(roomId);
-    if (r !== room) return;                         // room torn down / replaced
-    if (hostConnected()) { room.finalizing = false; return; }  // host came back → stand down
+    if (r === room && hostConnected()) { room.finalizing = false; return; }  // host came back → stand down
+    // Room object REPLACED (a rejoin rebuilt it) → the new room's own lifecycle
+    // owns settlement; stand down. But room GONE (r === undefined) must NOT
+    // stand down: when every survivor drops their socket right after the
+    // terminal, teardown (rooms.delete + ROOM CLOSED) used to abort this timer
+    // and the status write was lost — the room sat 'racing' forever and Browse
+    // kept offering Spectate on a dead race (BADGE2 2026-07-13). The CAS below
+    // is DB-guarded, so running it after teardown is safe.
+    if (r !== room && r !== undefined) { room.finalizing = false; return; }
     try {
       // Guarded to status='racing' so it can NEVER override a finished/cancelled
       // room, and never finalizes a race that isn't actually running.
@@ -207,10 +235,11 @@ async function maybeServerFinalize(roomId, room) {
         .eq('id', roomId).eq('status', 'racing');
       if (error) { room.finalizing = false; log('SERVER-FINALIZE failed', roomId, error.message); }
       else {
-        log(`SERVER-FINALIZE room=${roomId} host=${room.hostId} (absent; race complete)`);
+        log(`SERVER-FINALIZE room=${roomId} host=${room.hostId} (absent; race complete${r === room ? '' : '; room already closed'})`);
         // The DB write alone ends nothing on screen — push the terminal state
-        // to every surviving socket too (GPS-grace path).
-        deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
+        // to every surviving socket too (GPS-grace path). Skipped when the room
+        // is already closed: there is no socket left to deliver to.
+        if (r === room) deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
       }
     } catch (e) { room.finalizing = false; log('SERVER-FINALIZE error', roomId, e && e.message); }
   }, HOST_FINALIZE_GRACE_MS);
@@ -459,7 +488,7 @@ const server = http.createServer((req, res) => {
   if (!isUpgrade && (req.method === 'GET' || req.method === 'HEAD')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     // HEAD probes (e.g. `curl -I`, some uptime checkers) want headers only.
-    res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', rooms: rooms.size, connections: allClients.size }));
+    res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', rooms: rooms.size, connections: allClients.size, ...BUILD_INFO }));
     return;
   }
   res.writeHead(404, { 'Content-Type': 'application/json' });
