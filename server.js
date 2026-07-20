@@ -99,7 +99,7 @@ const STATIONARY_KMH          = 0.8;             // == 0.222 m/s (client stall g
 // racer is alive on the Supabase fallback and the timer resets instead.
 // SERVER_GONE_GRACE_MS mirrors the client's 90s "gone" window for the
 // completion check ONLY (it never writes anything).
-const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
+const RACER_GONE_EVICT_MS   = 3 * 60 * 1000;   // 2026-07-20: 10min→3min (user-accepted rejoin cutoff; fallback-progress stand-down still protects live racers)
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
 const SERVER_GONE_GRACE_MS  = 90 * 1000;
