@@ -123,9 +123,45 @@ const EMPTY_ROOM_TTL_MS     = RACER_GONE_EVICT_MS + 5 * 60 * 1000; // keep empty
 
 // Completion reasons the elected client driver only emits AFTER a DB-verified
 // checkRaceComplete() (runAutoEnd / last-finisher / last-quitter). We treat these
-// as authoritative "race is complete"; host_* reasons are host-initiated and need
-// no server fallback (the host's own RPC call succeeds).
+// as authoritative "race is complete". This set gates the H7 anti-grief check
+// only — see TERMINAL_SETTLE_STATUS for who actually settles the room.
 const VERIFIED_COMPLETE_REASONS = new Set(['all_done', 'all_finished']);
+
+// ── P2.5 Phase B0 (2026-07-29) ───────────────────────────────────────────────
+// Every terminal reason a client can relay, mapped to the room status that
+// client writes for it TODAY. The values mirror LiveRaceScreen/RaceResultsScreen
+// exactly and must keep doing so — changing one silently rewrites race history
+// and lifetime stats:
+//   host_quit         -> cancelled   (LiveRaceScreen.js:2901, host quit, last racer)
+//   host_cancelled    -> cancelled
+//   host_ended        -> finished    (:2156 handleHostEndRace)
+//   host_removed_last -> finished    (:3026 handleRemoveRacer)
+//   all_done          -> finished    (:3152 runAutoEnd)
+//   all_finished      -> finished    (:2812 handleFinish, :2981 handleQuit)
+// The old comment here claimed host_* reasons "need no server fallback (the
+// host's own RPC call succeeds)". That is true only while the client still
+// writes the status. Phase B deletes those writes, so the server must own every
+// one of these or the room sits 'racing' forever (BADGE2, 2026-07-13).
+const TERMINAL_SETTLE_STATUS = new Map([
+  ['host_quit',         'cancelled'],
+  ['host_cancelled',    'cancelled'],
+  ['host_ended',        'finished'],
+  ['host_removed_last', 'finished'],
+  ['all_done',          'finished'],
+  ['all_finished',      'finished'],
+]);
+
+// Delay before the server settles a RELAYED terminal. This is a correctness
+// requirement, not politeness. settle_room's R-09 marks latch dnf_final=true,
+// and save_race_result refuses to write once that latch is set:
+//     where race_results.finish_position is null and race_results.dnf_final is not true
+// Settling the instant the terminal is relayed would therefore DROP each
+// surviving racer's own result write (silently — the RPC returns success with 0
+// rows) and leave them holding room_members.last_distance_m, which can lag well
+// behind their real distance. Letting their write land first inverts the order:
+// mark_member_lifecycle then merges via GREATEST(distance) instead of replacing
+// it, so the racer keeps their true distance AND gains the DNF latch.
+const TERMINAL_SETTLE_GRACE_MS = 5000;
 
 // roomId -> { clients: Set<ws>, gps: Map<userId, {user_id,distance_m,speed_kmh,ts}>, dirty: boolean }
 const rooms = new Map();
@@ -336,6 +372,31 @@ async function settleRoom(roomId, status, reason) {
   } catch (e) { log('SETTLE error', roomId, e && e.message); return null; }
 }
 const settleWon = (v) => typeof v === 'string' && v.startsWith('settled:');
+
+// ── P2.5 Phase B0 (2026-07-29) ───────────────────────────────────────────────
+// Settle a room the server has just relayed a terminal for. Today this is pure
+// redundancy: the client that sent the race_over also wrote the status, so
+// settle_room's CAS returns 'lost' and this is a no-op. That is exactly what
+// makes B0 safe to deploy AHEAD of the client OTA — it cannot change the
+// outcome for an un-adopted client, it only removes the dependency on one.
+// After Phase B deletes the client writes, this becomes the settle.
+//
+// Deliberately NOT cancelled by room GC. When every survivor drops their socket
+// right after the terminal, teardown used to abort the pending status write and
+// the room sat 'racing' forever (BADGE2 2026-07-13); settleRoom is DB-only and
+// safe to run against a torn-down room, so the timer must outlive the room.
+function scheduleTerminalSettle(roomId, room, reason) {
+  const status = TERMINAL_SETTLE_STATUS.get(reason);
+  if (!status) return;                       // unknown/absent reason → not ours to settle
+  if (room.terminalSettleTimer) return;      // one per room; repeat race_over relays are no-ops
+  room.terminalSettleTimer = setTimeout(async () => {
+    room.terminalSettleTimer = null;
+    const verdict = await settleRoom(roomId, status, reason);
+    // Verdict is logged by settleRoom. 'lost' is the EXPECTED result until the
+    // client OTA lands and is not an error — do not add a failure branch here.
+    if (settleWon(verdict)) log(`TERMINAL-SETTLE room=${roomId} ${status} reason=${reason}`);
+  }, TERMINAL_SETTLE_GRACE_MS);
+}
 
 // ── Eviction policy (2026-07-12) ─────────────────────────────────────────────
 // Evict one racer: durable DNF via the service-role-only evict_racer_dnf RPC
@@ -843,6 +904,12 @@ wss.on('connection', async (ws, req) => {
             }
             deliverTerminal(room, roomId, payload, ws);
             if (verified) maybeServerFinalize(roomId, room);
+            // P2.5 Phase B0: the server now settles every relayed terminal,
+            // instead of trusting the sender's client to have done it. Runs
+            // alongside maybeServerFinalize on purpose — both are CAS-guarded by
+            // settle_room, so at most one wins and terminal delivery above is
+            // untouched either way.
+            scheduleTerminalSettle(roomId, room, payload.reason);
           })();
           return;
         }
