@@ -104,6 +104,20 @@ const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
 const SERVER_GONE_GRACE_MS  = 90 * 1000;
 const COMPLETE_DEBOUNCE_MS  = 5000;              // one DB completion check per burst of events
+// A finisher whose race_results write failed has no row, so `settled` in
+// maybeCompleteRace never sees them; they are still connected, so the 90s-gone
+// shortcut cannot resolve them either, and the room hangs until the stationary sweep
+// DNFs a racer who genuinely finished. This resolves them from the server's OWN
+// witnessed 'finished' relay (st.finished, set only after payload.user_id is
+// overwritten with the authenticated id, so it can never be forged for a peer).
+// DELIBERATELY longer than the client's FINISH_NOROW_DWELL_MS: the client polls every
+// 10s and must always be the one to settle when any driver is present, so this term
+// can only ever fire in a room the clients have already left or cannot settle.
+// RETUNED 30s -> 90s to track the client's 15s -> 60s (c9eb5d7). The client's worst
+// case is dwell 60s + up to one 10s heartbeat = 70s, and 90s clears that by 20s, plus
+// COMPLETE_DEBOUNCE_MS (5s) on top of the trigger. Any future change to the client
+// constant MUST raise this in the same batch or the ordering guarantee is lost.
+const FINISH_NOROW_DWELL_MS = 90 * 1000;
 const EVICT_PROGRESS_EPS_M  = 25;                // > half a client 50m save quantum = real progress
 const EMPTY_ROOM_TTL_MS     = RACER_GONE_EVICT_MS + 5 * 60 * 1000; // keep empty active rooms for pending evictions
 
@@ -229,11 +243,11 @@ async function maybeServerFinalize(roomId, room) {
     if (r !== room && r !== undefined) { room.finalizing = false; return; }
     try {
       // Guarded to status='racing' so it can NEVER override a finished/cancelled
-      // room, and never finalizes a race that isn't actually running.
-      const { error } = await supabase
-        .from('race_rooms').update({ status: 'finished' })
-        .eq('id', roomId).eq('status', 'racing');
-      if (error) { room.finalizing = false; log('SERVER-FINALIZE failed', roomId, error.message); }
+      // room, and never finalizes a race that isn't actually running. The CAS now
+      // lives inside settle_room; a null verdict is the RPC-failure branch and maps
+      // 1:1 onto the `error` this site checked before.
+      const verdict = await settleRoom(roomId, 'finished', 'all_done');
+      if (verdict === null) { room.finalizing = false; log('SERVER-FINALIZE failed', roomId); }
       else {
         log(`SERVER-FINALIZE room=${roomId} host=${room.hostId} (absent; race complete${r === room ? '' : '; room already closed'})`);
         // The DB write alone ends nothing on screen — push the terminal state
@@ -254,12 +268,74 @@ async function abandonRaceInactive(roomId, room) {
   log(`INACTIVITY-ABANDON room=${roomId}`);
   if (supabase) {
     try {
-      await supabase.from('race_rooms').update({ status: 'cancelled' })
-        .eq('id', roomId).eq('status', 'racing');   // guarded: never overrides a settled room
+      await settleRoom(roomId, 'cancelled', 'inactivity_abandon');   // guarded: never overrides a settled room
     } catch (e) { log('ABANDON status update failed', roomId, e && e.message); }
   }
   deliverTerminal(room, roomId, { reason: 'inactivity_abandon' });
 }
+
+// ── P2 lifecycle mark (2026-07-27) ───────────────────────────────────────────
+// Stamp a racer's server-owned terminal state via the service-role-only
+// mark_member_lifecycle RPC (advisory-locked, stands down on a settled room or
+// an existing ranked row, and writes the legacy quit/dnf race_results row in the
+// same transaction).
+//
+// NEVER throws and never blocks a relay: every caller treats a failed mark as
+// "no mark landed", which degrades to exactly the pre-P2 behaviour. That is the
+// whole safety argument for calling it from the hot path.
+//
+// Requires 20260727_p2_member_lifecycle.sql + 20260727_p2_mark_member_lifecycle.sql
+// to be APPLIED FIRST. Deployed ahead of them, every call returns a PostgREST
+// error, gets logged, and changes nothing.
+async function markLifecycle(roomId, userId, lifecycle, reason) {
+  if (!supabase) return null;                             // TEST_MODE: fully inert
+  try {
+    const { data: verdict, error } = await supabase.rpc('mark_member_lifecycle', {
+      p_room_id: roomId, p_user_id: userId, p_lifecycle: lifecycle, p_reason: reason,
+    });
+    if (error) { log('MARK rpc failed', roomId, userId, lifecycle, error.message); return null; }
+    // 'no_member' is EXPECTED on a client-initiated quit: handleQuit writes its own
+    // DNF row via save_race_result and then deletes the membership row, so the mark
+    // can legitimately arrive after the row is gone. The result row already exists,
+    // so nothing is lost — the shim matters for server-originated marks.
+    log(`MARK room=${roomId} user=${userId} ${lifecycle} -> ${verdict}`);
+    return verdict;
+  } catch (e) { log('MARK error', roomId, userId, e && e.message); return null; }
+}
+
+// ── P2.5 Phase A settle (2026-07-28) ─────────────────────────────────────────
+// Settle a room through the service-role-only settle_room RPC instead of a bare
+// guarded UPDATE. One transaction does three things the five settle sites cannot
+// do for themselves:
+//   1. the SAME CAS they use today (.eq('status','racing')), in-transaction;
+//   2. the R-09 marks — racers this settle is about to end who never quit and
+//      never finished get a 'dnf' mark + result row. These MUST happen before the
+//      status write: mark_member_lifecycle returns 'room_settled' and writes
+//      nothing once status <> 'racing', so marking from deliverTerminal (every
+//      call site of which runs AFTER the status write) would always no-op;
+//   3. the race-voice storage cleanup, which until now only ever ran on the
+//      client's update_room_status path — every server-originated settle leaked
+//      its recordings.
+//
+// Verdict: 'settled:<n>' (we won the CAS, n racers marked) | 'lost' (someone else
+// settled first) | 'no_room' | 'bad_status'. Returns null on RPC failure, which
+// callers treat exactly as today's `error` branch.
+//
+// Requires 20260728_p25a_settle_room.sql to be APPLIED FIRST. Deployed ahead of
+// it, every call returns a PostgREST error and the room is NOT settled — so this
+// deploy is gated on the DDL, unlike the P2 mark whose failure was inert.
+async function settleRoom(roomId, status, reason) {
+  if (!supabase) return null;                             // TEST_MODE: fully inert
+  try {
+    const { data: verdict, error } = await supabase.rpc('settle_room', {
+      p_room_id: roomId, p_status: status, p_reason: reason,
+    });
+    if (error) { log('SETTLE rpc failed', roomId, status, error.message); return null; }
+    log(`SETTLE room=${roomId} ${status} -> ${verdict}`);
+    return verdict;
+  } catch (e) { log('SETTLE error', roomId, e && e.message); return null; }
+}
+const settleWon = (v) => typeof v === 'string' && v.startsWith('settled:');
 
 // ── Eviction policy (2026-07-12) ─────────────────────────────────────────────
 // Evict one racer: durable DNF via the service-role-only evict_racer_dnf RPC
@@ -273,10 +349,23 @@ async function evictRacer(roomId, room, userId, reason) {
   st.evicting = true;
   try {
     const { data: m, error: mErr } = await supabase.from('room_members')
-      .select('last_distance_m').eq('room_id', roomId).eq('user_id', userId)
+      .select('last_distance_m, lifecycle').eq('room_id', roomId).eq('user_id', userId)
       .eq('role', 'racer').maybeSingle();
     if (mErr) { log('EVICT member read failed', roomId, userId, mErr.message); return; }
     if (!m) { st.quit = true; scheduleCompletionCheck(roomId, room); return; } // row gone → already quit/kicked
+    // P2: row absence is no longer the only "already resolved" signal — P1.5 keeps
+    // the row while the room is racing. The in-memory guard at the top of this
+    // function (st.quit / st.finished) is lost on a PM2 restart, after which this
+    // would stamp dnf_final onto an already-quit racer's row. The column survives
+    // the restart; trust it. Optional-chained so a deploy that lands before the
+    // migration degrades to the old behaviour instead of misreading undefined.
+    if (m.lifecycle && m.lifecycle !== 'active') {
+      if (m.lifecycle === 'finished') { st.finished = true; room.hasFinisher = true; }
+      else st.quit = true;
+      log(`EVICT stand-down (lifecycle=${m.lifecycle}) room=${roomId} user=${userId}`);
+      scheduleCompletionCheck(roomId, room);
+      return;
+    }
     const dbDist = m.last_distance_m || 0;
     const baseline = Math.max(st.baselineDist || 0, st.lastDist || 0);
     if (dbDist > baseline + EVICT_PROGRESS_EPS_M) {
@@ -304,6 +393,11 @@ async function evictRacer(roomId, room, userId, reason) {
     if (verdict === 'room_settled' || verdict === 'no_room') return;
     if (verdict === 'already_finished') { st.finished = true; room.hasFinisher = true; return; }
     st.evicted = true; st.evictReason = reason;
+    // P2: evict_racer_dnf already wrote the durable row; this stamps the matching
+    // participant state so a restart-blind re-evict stands down at the check above.
+    // The shim's upsert is GREATEST/OR on distance and dnf_final, so it can only
+    // agree with what evict_racer_dnf just wrote, never downgrade it.
+    await markLifecycle(roomId, userId, 'dnf', reason);
     room.gps.delete(userId);
     log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=${timeMs}`);
     // Peers render this exactly like a quit (✕ + completion math via the DNF row);
@@ -365,11 +459,27 @@ async function maybeCompleteRace(roomId, room) {
   if (!supabase || room.terminal || room.completing) return;
   room.completing = true;
   try {
-    const [{ data: members, error: mErr }, { data: results, error: rErr }] = await Promise.all([
-      supabase.from('room_members').select('user_id').eq('room_id', roomId).eq('role', 'racer'),
+    const [{ data: rawMembers, error: mErr }, { data: results, error: rErr }] = await Promise.all([
+      supabase.from('room_members').select('user_id, lifecycle').eq('room_id', roomId).eq('role', 'racer'),
       supabase.from('race_results').select('user_id, finish_position').eq('room_id', roomId),
     ]);
-    if (mErr || rErr || !members || members.length === 0) return;
+    // P2: drop ONLY the terminal-with-row states. 'finished' deliberately STAYS in
+    // the roster — dropping it would relax the rule that every roster racer needs a
+    // race_results row, so a racer marked finished by the relay whose
+    // assign_race_position later failed would count as resolved while still
+    // rowless, which is precisely the hole the dwell term below exists to close.
+    // Pre-migration (lifecycle undefined) every row is kept: identical to today.
+    const members = (rawMembers || []).filter(mm => mm.lifecycle !== 'quit' && mm.lifecycle !== 'dnf');
+    if (mErr || rErr || !rawMembers || members.length === 0) return;
+    // room.meta is otherwise populated lazily on first eviction, so targetM would be
+    // undefined here in most rooms and the rowless-finisher term below could never
+    // fire. Hydrate on demand; a failed read leaves targetM 0, which disables that
+    // term only (fail-closed — it can never resolve a racer without a real target).
+    if (!room.meta) {
+      const { data: r } = await supabase
+        .from('race_rooms').select('started_at, target_distance_m').eq('id', roomId).single();
+      if (r) room.meta = { startedAt: r.started_at, targetM: r.target_distance_m };
+    }
     const settled = new Set((results || []).map(r => r.user_id));
     const hasFinisher = (results || []).some(r => r.finish_position != null);
     const now = Date.now();
@@ -382,26 +492,35 @@ async function maybeCompleteRace(roomId, room) {
       // settled out from under a screen-locked racer who is still racing.
       if (!hasFinisher) return true;
       const st = room.racers.get(user_id);
+      // Rowless-finisher term (client parity, strictly weaker). Resolve a racer whose
+      // 'finished' relay THIS server witnessed >= FINISH_NOROW_DWELL_MS ago and whose
+      // server-tracked distance reached the target, even though no row landed. Without
+      // it the room hangs on the missing row until the stationary sweep writes
+      // dnf_final on a real finisher. Dwell + our own witnessed relay + the existing
+      // hasFinisher gate keep this strictly more conservative than the client term.
+      if (st && st.finished && st.finishedAt && now - st.finishedAt >= FINISH_NOROW_DWELL_MS) {
+        const targetM = room.meta?.targetM || 0;
+        const dist = Math.max(room.gps.get(user_id)?.distance_m || 0, st.lastDist || 0);
+        if (targetM > 0 && dist >= targetM) return false;
+      }
       return !(st && !st.connected && st.disconnectedAt && now - st.disconnectedAt >= SERVER_GONE_GRACE_MS);
     });
     if (unresolved.length) return;
     if (hasFinisher) {
       // Status CAS (same guard as maybeServerFinalize): exactly one settler wins;
       // deliver the terminal only if WE won, so reasons never conflict.
-      const { data: won, error } = await supabase.from('race_rooms')
-        .update({ status: 'finished' }).eq('id', roomId).eq('status', 'racing').select('id');
-      if (error) { log('SERVER-COMPLETE failed', roomId, error.message); return; }
-      if (won && won.length) {
+      const won = await settleRoom(roomId, 'finished', 'all_done');
+      if (won === null) { log('SERVER-COMPLETE failed', roomId); return; }
+      if (settleWon(won)) {
         log(`SERVER-COMPLETE room=${roomId}`);
         deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
       }
     } else {
       // C5: zero finishers → a race with no outcome is 'cancelled', never an
       // all-DNF 'finished'.
-      const { data: won, error } = await supabase.from('race_rooms')
-        .update({ status: 'cancelled' }).eq('id', roomId).eq('status', 'racing').select('id');
-      if (error) { log('SERVER-COMPLETE cancel failed', roomId, error.message); return; }
-      if (won && won.length) {
+      const won = await settleRoom(roomId, 'cancelled', 'inactivity_abandon');
+      if (won === null) { log('SERVER-COMPLETE cancel failed', roomId); return; }
+      if (settleWon(won)) {
         log(`SERVER-COMPLETE (no finishers → cancelled) room=${roomId}`);
         deliverTerminal(room, roomId, { reason: 'inactivity_abandon' });
       }
@@ -442,14 +561,19 @@ async function maybeCloseHostAbandoned(roomId, room) {
     if (r !== room || room.terminal) { room.hostClosing = false; return; }
     if (hostConnected()) { room.hostClosing = false; return; }   // host returned within grace
     try {
+      // P2: the comment above ("quit racers already deleted their row") no longer
+      // holds for a server-marked quit/dnf, so exclude those explicitly or a room
+      // whose racers have all left stays 'racing' forever. Only quit/dnf are
+      // excluded: a 'finished' racer still on the HUD keeps their row and keeps
+      // being counted, exactly as today.
       const { count, error: cErr } = await supabase.from('room_members')
         .select('user_id', { count: 'exact', head: true })
-        .eq('room_id', roomId).eq('role', 'racer').neq('user_id', room.hostId);
+        .eq('room_id', roomId).eq('role', 'racer').neq('user_id', room.hostId)
+        .not('lifecycle', 'in', '("quit","dnf")');
       if (cErr) { room.hostClosing = false; log('HOST-ABANDON count failed', roomId, cErr.message); return; }
       if ((count || 0) > 1) { room.hostClosing = false; log(`HOST-ABANDON stand-down room=${roomId} remaining=${count}`); return; }
-      const { error } = await supabase.from('race_rooms').update({ status: 'cancelled' })
-        .eq('id', roomId).eq('status', 'racing');
-      if (error) { room.hostClosing = false; log('HOST-ABANDON cancel failed', roomId, error.message); return; }
+      const verdict = await settleRoom(roomId, 'cancelled', 'host_quit');
+      if (verdict === null) { room.hostClosing = false; log('HOST-ABANDON cancel failed', roomId); return; }
       log(`HOST-ABANDON-CLOSE room=${roomId} host=${room.hostId} remaining=${count}`);
       deliverTerminal(room, roomId, { reason: 'host_quit' });
     } catch (e) { room.hostClosing = false; log('HOST-ABANDON error', roomId, e && e.message); }
@@ -610,148 +734,181 @@ wss.on('connection', async (ws, req) => {
     } catch (e) {
       return; // ignore malformed frames
     }
-    if (!msg || typeof msg.event !== 'string') return;
-    const event = msg.event;
-    const payload = msg.payload || {};
+    // M-3: everything past JSON.parse runs inside this guard so a malformed or
+    // unexpected frame kills only THIS message, not the process. An uncaught
+    // throw here would drop every room on the server. Never swallowed — the
+    // catch logs the offending event type + error.
+    try {
+      if (!msg || typeof msg.event !== 'string') return;
+      const event = msg.event;
+      const payload = msg.payload || {};
 
-    // Delivery receipt for enveloped sends: any message carrying a mid gets an
-    // ack back to the SENDER so its bounded retry loop can stop.
-    if (typeof msg.mid === 'string') send(ws, { event: 'ack', payload: { mid: msg.mid } });
+      // Delivery receipt for enveloped sends: any message carrying a mid gets an
+      // ack back to the SENDER so its bounded retry loop can stop.
+      if (typeof msg.mid === 'string') send(ws, { event: 'ack', payload: { mid: msg.mid } });
 
-    // Client confirms it received the terminal broadcast — stop re-sending.
-    if (event === 'race_over_ack') {
-      ws.ackedTerminalMid = payload.mid;
-      return;
-    }
-
-    // App-level keepalive: echo pings so the client can measure TRANSPORT
-    // liveness even when the room is quiet (no gps_batch traffic). Before
-    // this, 'ping' fell through to "unknown event — ignore", so a silent
-    // room was indistinguishable from a dead socket (ISS-03).
-    if (event === 'ping') {
-      send(ws, { event: 'pong', payload: { ts: payload.ts || Date.now() } });
-      return;
-    }
-
-    // gps: buffer the racer's latest position; the batch timer fans it out.
-    if (event === 'gps') {
-      if (ws.role !== 'racer') return; // only racers contribute positions
-      const st = room.racers.get(ws.userId);
-      if (st && st.evicted) return;    // evicted racers no longer feed the room
-      room.gps.set(ws.userId, {
-        user_id: ws.userId,
-        distance_m: payload.distance_m,
-        speed_kmh: payload.speed_kmh,
-        ts: payload.ts || Date.now(),
-      });
-      room.dirty = true;
-      // First gps marks the race live and seeds the movement clock.
-      if (!room.raceActive) { room.raceActive = true; room.lastMovementTs = Date.now(); }
-      // Real movement resets the stationary clock; if a warning is showing, cancel
-      // it — movement is the ONLY thing that can clear the abandon countdown.
-      if (typeof payload.speed_kmh === 'number' && payload.speed_kmh >= STATIONARY_KMH) {
-        room.lastMovementTs = Date.now();
-        if (room.inactivityWarnDeadline) {
-          room.inactivityWarnDeadline = 0;
-          broadcast(room, { event: 'inactivity_cleared', payload: {} });
-        }
-      }
-      // Eviction policy (REQ2): per-racer movement, judged on the frames THIS
-      // server receives — speed at/above the stall gate OR the accumulated
-      // distance advancing (so a forged speed field alone is not the signal).
-      if (st) {
-        const d = typeof payload.distance_m === 'number' ? payload.distance_m : 0;
-        const moved = (typeof payload.speed_kmh === 'number' && payload.speed_kmh >= STATIONARY_KMH)
-                      || d > (st.lastDist || 0) + 2;
-        if (d > (st.lastDist || 0)) st.lastDist = d;
-        if (moved) {
-          st.lastMoveTs = Date.now();
-          if (st.warnDeadline) {
-            st.warnDeadline = 0;
-            send(ws, { event: 'stationary_cleared', payload: {} });
-          }
-        }
-      }
-      return;
-    }
-
-    // request_positions: reply to the requester only with the current buffer.
-    if (event === 'request_positions') {
-      send(ws, {
-        event: 'gps_batch',
-        payload: { racers: Array.from(room.gps.values()), ts: Date.now() },
-      });
-      return;
-    }
-
-    // Everything else that the room cares about is relayed to the others.
-    if (FANOUT_EVENTS.has(event)) {
-      // Terminal event: reliable fan-out (ack + bounded retry) instead of a
-      // fire-and-forget relay — the sender navigates away and drops its socket
-      // immediately, but survivors must still end their HUD.
-      // Server-authoritative finalize FALLBACK is unchanged, just relocated:
-      // when the client driver declares a DB-verified completion but the host
-      // is gone, the driver's update_room_status RPC is rejected (host-only).
-      // Persist the status the client couldn't.
-      if (event === 'race_over') {
-        // Only the HOST may terminate the room for everyone — UNLESS the reason is
-        // a DB-verified completion (all_done/all_finished) that any elected client
-        // driver may legitimately report. Blocks a non-host racer/spectator from
-        // griefing the room with a forged race_over (H7).
-        const verified = VERIFIED_COMPLETE_REASONS.has(payload.reason);
-        (async () => {
-          if (!verified) {
-            if (room.hostId === undefined && supabase) {
-              try {
-                const { data } = await supabase.from('race_rooms').select('host_id').eq('id', roomId).single();
-                room.hostId = data ? data.host_id : null;
-              } catch (e) { if (room.hostId === undefined) room.hostId = null; }
-            }
-            if (!room.hostId || ws.userId !== room.hostId) {
-              log(`RACE_OVER rejected (non-host, unverified) room=${roomId} from=${ws.userId} reason=${payload && payload.reason}`);
-              return;
-            }
-          }
-          deliverTerminal(room, roomId, payload, ws);
-          if (verified) maybeServerFinalize(roomId, room);
-        })();
+      // Client confirms it received the terminal broadcast — stop re-sending.
+      if (event === 'race_over_ack') {
+        ws.ackedTerminalMid = payload.mid;
         return;
       }
-      // Never trust a client-supplied identity on a relayed event — a racer can
-      // only quit/finish as THEMSELVES. Overwrite with the authenticated id before
-      // fan-out so a forged payload.user_id can't eject/forge a peer (H7).
-      if (event === 'racer_quit' || event === 'finished') payload.user_id = ws.userId;
-      // Eviction policy: track per-racer terminal state (exempts finishers from
-      // the stationary sweep) and re-check completion — the DNF/finish row this
-      // event implies may be the last unresolved racer (REQ3: finishers may
-      // have left the HUD, so the server must be able to settle).
-      if (event === 'finished' || event === 'racer_quit') {
+
+      // App-level keepalive: echo pings so the client can measure TRANSPORT
+      // liveness even when the room is quiet (no gps_batch traffic). Before
+      // this, 'ping' fell through to "unknown event — ignore", so a silent
+      // room was indistinguishable from a dead socket (ISS-03).
+      if (event === 'ping') {
+        send(ws, { event: 'pong', payload: { ts: payload.ts || Date.now() } });
+        return;
+      }
+
+      // gps: buffer the racer's latest position; the batch timer fans it out.
+      if (event === 'gps') {
+        if (ws.role !== 'racer') return; // only racers contribute positions
         const st = room.racers.get(ws.userId);
-        if (st) { if (event === 'finished') st.finished = true; else st.quit = true; }
-        if (event === 'finished') room.hasFinisher = true;
-        scheduleCompletionCheck(roomId, room);
+        if (st && st.evicted) return;    // evicted racers no longer feed the room
+        room.gps.set(ws.userId, {
+          user_id: ws.userId,
+          distance_m: payload.distance_m,
+          speed_kmh: payload.speed_kmh,
+          ts: payload.ts || Date.now(),
+        });
+        room.dirty = true;
+        // First gps marks the race live and seeds the movement clock.
+        if (!room.raceActive) { room.raceActive = true; room.lastMovementTs = Date.now(); }
+        // Real movement resets the stationary clock; if a warning is showing, cancel
+        // it — movement is the ONLY thing that can clear the abandon countdown.
+        if (typeof payload.speed_kmh === 'number' && payload.speed_kmh >= STATIONARY_KMH) {
+          room.lastMovementTs = Date.now();
+          if (room.inactivityWarnDeadline) {
+            room.inactivityWarnDeadline = 0;
+            broadcast(room, { event: 'inactivity_cleared', payload: {} });
+          }
+        }
+        // Eviction policy (REQ2): per-racer movement, judged on the frames THIS
+        // server receives — speed at/above the stall gate OR the accumulated
+        // distance advancing (so a forged speed field alone is not the signal).
+        if (st) {
+          const d = typeof payload.distance_m === 'number' ? payload.distance_m : 0;
+          const moved = (typeof payload.speed_kmh === 'number' && payload.speed_kmh >= STATIONARY_KMH)
+                        || d > (st.lastDist || 0) + 2;
+          if (d > (st.lastDist || 0)) st.lastDist = d;
+          if (moved) {
+            st.lastMoveTs = Date.now();
+            if (st.warnDeadline) {
+              st.warnDeadline = 0;
+              send(ws, { event: 'stationary_cleared', payload: {} });
+            }
+          }
+        }
+        return;
       }
-      broadcast(room, { event, payload }, ws);
-      // A quit also drops the racer from the position buffer.
-      if (event === 'racer_quit') {
-        room.gps.delete(ws.userId);
-        // If the HOST is the one who quit, the room may now be host-less. Close it
-        // (graced, guarded, DB-authoritative racer count) as a safety net for when
-        // the host's own client failed to finalize. Self-gates: stands down at once
-        // if the host is still connected (a normal racer's quit, or host quit→rejoin).
-        maybeCloseHostAbandoned(roomId, room);
+
+      // request_positions: reply to the requester only with the current buffer.
+      if (event === 'request_positions') {
+        send(ws, {
+          event: 'gps_batch',
+          payload: { racers: Array.from(room.gps.values()), ts: Date.now() },
+        });
+        return;
       }
-      return;
-    }
 
-    // Host-only: kick a racer. Verified server-side against race_rooms.host_id —
-    // never relayed blindly (not in FANOUT_EVENTS).
-    if (event === 'kick_racer') {
-      handleKickRacer(ws, room, roomId, payload);
-      return;
-    }
+      // Everything else that the room cares about is relayed to the others.
+      if (FANOUT_EVENTS.has(event)) {
+        // Terminal event: reliable fan-out (ack + bounded retry) instead of a
+        // fire-and-forget relay — the sender navigates away and drops its socket
+        // immediately, but survivors must still end their HUD.
+        // Server-authoritative finalize FALLBACK is unchanged, just relocated:
+        // when the client driver declares a DB-verified completion but the host
+        // is gone, the driver's update_room_status RPC is rejected (host-only).
+        // Persist the status the client couldn't.
+        if (event === 'race_over') {
+          // Only the HOST may terminate the room for everyone — UNLESS the reason is
+          // a DB-verified completion (all_done/all_finished) that any elected client
+          // driver may legitimately report. Blocks a non-host racer/spectator from
+          // griefing the room with a forged race_over (H7).
+          const verified = VERIFIED_COMPLETE_REASONS.has(payload.reason);
+          (async () => {
+            if (!verified) {
+              if (room.hostId === undefined && supabase) {
+                try {
+                  const { data } = await supabase.from('race_rooms').select('host_id').eq('id', roomId).single();
+                  room.hostId = data ? data.host_id : null;
+                } catch (e) { if (room.hostId === undefined) room.hostId = null; }
+              }
+              if (!room.hostId || ws.userId !== room.hostId) {
+                log(`RACE_OVER rejected (non-host, unverified) room=${roomId} from=${ws.userId} reason=${payload && payload.reason}`);
+                return;
+              }
+            }
+            deliverTerminal(room, roomId, payload, ws);
+            if (verified) maybeServerFinalize(roomId, room);
+          })();
+          return;
+        }
+        // Never trust a client-supplied identity on a relayed event — a racer can
+        // only quit/finish as THEMSELVES. Overwrite with the authenticated id before
+        // fan-out so a forged payload.user_id can't eject/forge a peer (H7).
+        if (event === 'racer_quit' || event === 'finished') payload.user_id = ws.userId;
+        // Eviction policy: track per-racer terminal state (exempts finishers from
+        // the stationary sweep) and re-check completion — the DNF/finish row this
+        // event implies may be the last unresolved racer (REQ3: finishers may
+        // have left the HUD, so the server must be able to settle).
+        if (event === 'finished' || event === 'racer_quit') {
+          const st = room.racers.get(ws.userId);
+          if (st) {
+            if (event === 'finished') {
+              // finishedAt stamps the FIRST witnessed finish only, so the dwell window
+              // cannot be reset by a repeat relay (handleFinish resends on a landed
+              // retry, and raceSendReliable itself retries).
+              if (!st.finished) st.finishedAt = Date.now();
+              st.finished = true;
+            } else st.quit = true;
+          }
+          if (event === 'finished') room.hasFinisher = true;
+          scheduleCompletionCheck(roomId, room);
+          // P2: stamp the participant state, then RE-ARM the completion check.
+          // The unconditional schedule above is kept exactly as it was, so a slow
+          // or failing RPC can never cost us a check; this second, awaited one
+          // exists because the debounced check can otherwise fire BEFORE the mark
+          // (and its shim row) lands, find the racer unresolved, and not re-run
+          // until some later event happens to schedule it again.
+          // Deliberately not awaited by the handler: the broadcast below must not
+          // wait on a DB round-trip.
+          void (async () => {
+            await markLifecycle(roomId, ws.userId,
+              event === 'finished' ? 'finished' : 'quit',
+              event === 'finished' ? 'finish_relay' : 'client_quit');
+            scheduleCompletionCheck(roomId, room);
+          })();
+        }
+        broadcast(room, { event, payload }, ws);
+        // A quit also drops the racer from the position buffer.
+        if (event === 'racer_quit') {
+          room.gps.delete(ws.userId);
+          // If the HOST is the one who quit, the room may now be host-less. Close it
+          // (graced, guarded, DB-authoritative racer count) as a safety net for when
+          // the host's own client failed to finalize. Self-gates: stands down at once
+          // if the host is still connected (a normal racer's quit, or host quit→rejoin).
+          maybeCloseHostAbandoned(roomId, room);
+        }
+        return;
+      }
 
-    // Unknown event — ignore.
+      // Host-only: kick a racer. Verified server-side against race_rooms.host_id —
+      // never relayed blindly (not in FANOUT_EVENTS).
+      if (event === 'kick_racer') {
+        handleKickRacer(ws, room, roomId, payload);
+        return;
+      }
+
+      // Unknown event — ignore.
+    } catch (e) {
+      // M-3: one malformed/unexpected frame must kill only THIS message, never
+      // the process (which would drop every room). Log type + error; never silent.
+      log(`MESSAGE-DISPATCH error user=${ws.userId} room=${ws.roomId} event=${(msg && msg.event) || '?'} err=${e && e.message}`);
+      if (e && e.stack) console.error(e.stack);
+    }
   });
 
   function handleClose(code, reason) {
@@ -812,13 +969,20 @@ wss.on('connection', async (ws, req) => {
 // Sent to ALL members (including senders) so everyone shares one authoritative
 // snapshot. Skipped for rooms with no new updates since the last tick.
 const batchTimer = setInterval(() => {
-  for (const room of rooms.values()) {
-    if (!room.dirty || room.gps.size === 0) continue;
-    broadcast(room, {
-      event: 'gps_batch',
-      payload: { racers: Array.from(room.gps.values()), ts: Date.now() },
-    });
-    room.dirty = false;
+  // M-3: a throw in this sweep must not take the process down (it runs every
+  // room). Contain + log which sweep threw; the next tick recovers.
+  try {
+    for (const room of rooms.values()) {
+      if (!room.dirty || room.gps.size === 0) continue;
+      broadcast(room, {
+        event: 'gps_batch',
+        payload: { racers: Array.from(room.gps.values()), ts: Date.now() },
+      });
+      room.dirty = false;
+    }
+  } catch (e) {
+    log(`SWEEP error timer=batch err=${e && e.message}`);
+    if (e && e.stack) console.error(e.stack);
   }
 }, BATCH_INTERVAL_MS);
 
@@ -896,31 +1060,44 @@ function perRacerSweep(roomId, room, now) {
 }
 
 const inactivityTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [roomId, room] of rooms) {
-    if (room.clients.size === 0 && room.emptySince &&
-        (room.terminal || now - room.emptySince > EMPTY_ROOM_TTL_MS)) {
-      if (room.completeTimer) clearTimeout(room.completeTimer);
-      rooms.delete(roomId);
-      log(`ROOM GC room=${roomId}`);
-      continue;
+  // M-3: contain a throw so one bad room can't kill the whole lifecycle sweep
+  // (and with it every room's eviction/completion timing).
+  try {
+    const now = Date.now();
+    for (const [roomId, room] of rooms) {
+      if (room.clients.size === 0 && room.emptySince &&
+          (room.terminal || now - room.emptySince > EMPTY_ROOM_TTL_MS)) {
+        if (room.completeTimer) clearTimeout(room.completeTimer);
+        rooms.delete(roomId);
+        log(`ROOM GC room=${roomId}`);
+        continue;
+      }
+      if (!room.raceActive || room.terminal) continue;
+      roomLevelSweep(roomId, room, now);
+      if (!room.inactivityWarnDeadline) perRacerSweep(roomId, room, now);
     }
-    if (!room.raceActive || room.terminal) continue;
-    roomLevelSweep(roomId, room, now);
-    if (!room.inactivityWarnDeadline) perRacerSweep(roomId, room, now);
+  } catch (e) {
+    log(`SWEEP error timer=inactivity err=${e && e.message}`);
+    if (e && e.stack) console.error(e.stack);
   }
 }, INACTIVITY_TICK_MS);
 
 // ── Ping/pong: terminate connections that miss a heartbeat ───────────────────
 const pingTimer = setInterval(() => {
-  for (const ws of allClients) {
-    if (ws.isAlive === false) {
-      log('TERMINATE dead connection', ws.userId);
-      ws.terminate(); // fires 'close' -> handleClose cleans up
-      continue;
+  // M-3: contain a throw so the heartbeat sweep can't take the process down.
+  try {
+    for (const ws of allClients) {
+      if (ws.isAlive === false) {
+        log('TERMINATE dead connection', ws.userId);
+        ws.terminate(); // fires 'close' -> handleClose cleans up
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch (e) {}
     }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (e) {}
+  } catch (e) {
+    log(`SWEEP error timer=ping err=${e && e.message}`);
+    if (e && e.stack) console.error(e.stack);
   }
 }, PING_INTERVAL_MS);
 
@@ -943,3 +1120,27 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ── Last-resort crash guards (M-3) ──────────────────────────────────────────
+// The per-message dispatch and the three sweep timers are now individually
+// guarded, so these catch the residual: any other unexpected throw, and the
+// fire-and-forget async IIFEs (e.g. the race_over finalize). Without them,
+// Node 20 terminates the whole process on either event, dropping every
+// in-flight room at once. The two events are handled asymmetrically on purpose.
+process.on('uncaughtException', (err, origin) => {
+  // State is now undefined — the safe move is a clean exit + PM2 restart (~1-2s),
+  // NOT limping on in an unknown state. This is already Node's default; we add
+  // the structured context the raw crash never logged.
+  try { log(`FATAL uncaughtException origin=${origin} name=${err && err.name} msg=${err && err.message}`); } catch (_) {}
+  if (err && err.stack) { try { console.error(err.stack); } catch (_) {} }
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  // A stray rejected promise rarely corrupts global state; killing every live
+  // race for it is disproportionate. Log with context and KEEP RUNNING.
+  try {
+    const r = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+    log(`unhandledRejection (non-fatal, kept running) reason=${r}`);
+    if (reason instanceof Error && reason.stack) console.error(reason.stack);
+  } catch (_) {}
+});
