@@ -161,7 +161,15 @@ const TERMINAL_SETTLE_STATUS = new Map([
 // behind their real distance. Letting their write land first inverts the order:
 // mark_member_lifecycle then merges via GREATEST(distance) instead of replacing
 // it, so the racer keeps their true distance AND gains the DNF latch.
-const TERMINAL_SETTLE_GRACE_MS = 5000;
+//
+// THE VALUE IS DERIVED, NOT PICKED. The writes this grace protects are the
+// client's own post-terminal save_race_result calls, and every one of them is
+// wrapped in step(..., 8000): LiveRaceScreen applyRaceOver (:2133) and
+// runAutoEnd (:3163). A grace shorter than that bound loses the race against a
+// slow-but-successful write on exactly the connections that need it most. 9000
+// clears the 8000 ceiling with a second to spare. If either step() bound moves,
+// this must move with it — grep save_race_result in LiveRaceScreen.js.
+const TERMINAL_SETTLE_GRACE_MS = 9000;
 
 // roomId -> { clients: Set<ws>, gps: Map<userId, {user_id,distance_m,speed_kmh,ts}>, dirty: boolean }
 const rooms = new Map();
