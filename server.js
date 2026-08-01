@@ -467,7 +467,16 @@ async function evictRacer(roomId, room, userId, reason) {
     // The shim's upsert is GREATEST/OR on distance and dnf_final, so it can only
     // agree with what evict_racer_dnf just wrote, never downgrade it.
     await markLifecycle(roomId, userId, 'dnf', reason);
-    room.gps.delete(userId);
+    // E-09: deliberately NOT room.gps.delete(userId). Dropping the entry took the
+    // racer out of the next position batch, so their dot VANISHED from every map
+    // instead of freezing where they stopped. A marked participant stays in the
+    // batch structurally; their last position is still the truth about where they
+    // are, and st.evicted is what tells peers how to render them (✕, exactly like
+    // a quit). Completion maths reads the DNF row, never this map, so keeping the
+    // entry cannot hold a room open.
+    // The other gps.delete call sites are NOT this case and stay: a kick removes
+    // someone from the race entirely, and the close/disconnect paths tear the room
+    // or socket down rather than marking a participant.
     log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=${timeMs}`);
     // Peers render this exactly like a quit (✕ + completion math via the DNF row);
     // the victim gets a targeted terminal instead (now, or on reconnect via JOIN).
