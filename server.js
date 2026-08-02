@@ -347,6 +347,71 @@ async function markLifecycle(roomId, userId, lifecycle, reason) {
   } catch (e) { log('MARK error', roomId, userId, e && e.message); return null; }
 }
 
+// ── E-11 (2026-08-03): rehydrate a rejoining racer's terminal state ──────────
+// room.racers is memory-only, so ANY loss of the room object mints a fresh `st`
+// with evicted/quit/finished all false on the next JOIN. Three ways to lose it,
+// all reachable mid-race: a PM2 restart (uncaughtException exits 1), a deploy,
+// and the empty-room GC — which runs after EMPTY_ROOM_TTL_MS, or immediately
+// once room.terminal is set.
+//
+// The victim is the problem. An already-DNF'd racer rejoins as a live one: the
+// `evicted` send at JOIN reads the very flag that was just lost, so they are
+// never told, and they resume feeding gps into the batch. Peers on the new room
+// object have no record either — the E-17 client guard keys off the
+// racer_quit{evicted:true} broadcast, which nothing re-sends.
+//
+// evictRacer already distrusts memory for exactly this reason and re-reads
+// room_members.lifecycle (see its 'P2:' note). This applies that same rule at the
+// one other place that decides a racer's state. The column is the durable record
+// and it survives every loss listed above.
+//
+// DELIBERATELY NOT AWAITED by the JOIN handler: a DB round-trip must never delay
+// adding the socket to the room or replaying a pinned terminal. Same idiom as the
+// post-relay markLifecycle. The cost is a short window — one read — in which the
+// racer is treated as active; it ends with the same two messages evictRacer sends.
+//
+// FAILS OPEN. A read error, a missing row, or an 'active'/absent lifecycle leaves
+// today's behaviour byte-for-byte. Only a definite terminal lifecycle changes it.
+async function hydrateRacerFromDb(roomId, room, userId, st) {
+  if (!supabase) return;                                  // TEST_MODE: fully inert
+  try {
+    const { data: m, error } = await supabase.from('room_members')
+      .select('lifecycle, lifecycle_reason').eq('room_id', roomId).eq('user_id', userId)
+      .eq('role', 'racer').maybeSingle();
+    if (error) { log('HYDRATE read failed', roomId, userId, error.message); return; }
+    if (!m || !m.lifecycle || m.lifecycle === 'active') return;
+    // The room may have been replaced or torn down while the read was in flight,
+    // and the racer's own state may have advanced on a relay. Memory wins then.
+    if (rooms.get(roomId) !== room || room.racers.get(userId) !== st) return;
+    if (st.finished || st.quit || st.evicted) return;
+    if (m.lifecycle === 'finished') {
+      st.finished = true; room.hasFinisher = true;
+      // finishedAt is deliberately left unset. It drives the rowless-finisher
+      // dwell in maybeCompleteRace, and stamping it here would start that clock
+      // from the rejoin rather than from the finish this server never witnessed.
+      // Absent, the term simply cannot fire (fail-closed) and the racer still
+      // needs a real result row to resolve — which is the correct outcome.
+      log(`HYDRATE room=${roomId} user=${userId} finished`);
+      return;
+    }
+    if (m.lifecycle === 'quit') {
+      st.quit = true;
+      log(`HYDRATE room=${roomId} user=${userId} quit`);
+      return;
+    }
+    // 'dnf' — restore the eviction and re-send BOTH halves evictRacer sends, so
+    // the victim learns they are out and peers render the ✕ (E-17). Idempotent
+    // on the client: quitUsersRef is a set.
+    st.evicted = true;
+    st.evictReason = m.lifecycle_reason || 'disconnect_timeout';
+    let victimWs = null;
+    for (const c of room.clients) if (c.userId === userId) victimWs = c;
+    broadcast(room, { event: 'racer_quit', payload: { user_id: userId, evicted: true } }, victimWs);
+    if (victimWs) send(victimWs, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason } });
+    log(`HYDRATE room=${roomId} user=${userId} evicted reason=${st.evictReason}`);
+  } catch (e) { log('HYDRATE error', roomId, userId, e && e.message); }
+}
+
 // ── P2.5 Phase A settle (2026-07-28) ─────────────────────────────────────────
 // Settle a room through the service-role-only settle_room RPC instead of a bare
 // guarded UPDATE. One transaction does three things the five settle sites cannot
@@ -822,6 +887,7 @@ wss.on('connection', async (ws, req) => {
   // of silently re-entering the live race.
   if (role === 'racer') {
     let st = room.racers.get(userId);
+    const fresh = !st;
     if (!st) {
       st = { connected: true, disconnectedAt: 0, lastMoveTs: Date.now(), lastDist: 0,
              baselineDist: 0, warnDeadline: 0, finished: false, quit: false,
@@ -830,7 +896,14 @@ wss.on('connection', async (ws, req) => {
     }
     st.connected = true; st.disconnectedAt = 0; st.goneNotified = false;
     st.lastMoveTs = Date.now();                 // reconnect re-seeds the stationary clock
-    if (st.evicted) send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout' } });
+    // E-11: an ABSENT entry means either a genuine first join or a room object
+    // this server lost (restart / GC) — only the DB can tell those apart, so ask
+    // it. When `st` already existed, memory is the NEWER record (the finished /
+    // quit relay stamps it before mark_member_lifecycle lands), so this must
+    // never run for a live entry. A fresh entry can never be evicted yet, which
+    // is why the pinned-terminal send below is the other branch, not both.
+    if (fresh) void hydrateRacerFromDb(roomId, room, userId, st);
+    else if (st.evicted) send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout' } });
   }
 
   // A socket (re)joining a room that already ended must learn that immediately —
