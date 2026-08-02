@@ -97,9 +97,36 @@ const STATIONARY_KMH          = 0.8;             // == 0.222 m/s (client stall g
 // minutes gets a 60s personal warning, then is evicted. Both paths re-read
 // room_members.last_distance_m before evicting — progress there means the
 // racer is alive on the Supabase fallback and the timer resets instead.
+//
+// ⚠️ THAT STAND-DOWN IS MUCH WEAKER THAN THE LINE ABOVE READS (measured E-13,
+// 2026-08-03). room_members.last_distance_m has exactly ONE writer in the whole
+// client — the AppState->'background' handler at LiveRaceScreen.js:519. There is
+// no periodic write. handleClose seeds st.baselineDist to the last WS-known
+// distance, so the stand-down fires only if a FURTHER background transition
+// happens during the outage. A racer in a tunnel with the app in the FOREGROUND
+// can never be protected by it, and neither can one already backgrounded and
+// staying there. Do not cite it as general protection for live racers.
+//
 // SERVER_GONE_GRACE_MS mirrors the client's 90s "gone" window for the
 // completion check ONLY (it never writes anything).
-const RACER_GONE_EVICT_MS   = 3 * 60 * 1000;   // 2026-07-20: 10min→3min (user-accepted rejoin cutoff; fallback-progress stand-down still protects live racers)
+
+// E-13: 3min -> 10min, 2026-08-03, reverting the 2026-07-20 retune with the
+// owner's explicit go. The 07-20 change to 3min was made to clear GHOST AVATARS
+// (a swipe-killed racer's frozen avatar persists in peers' standings until the
+// eviction ✕), and it leaned on the fallback-progress stand-down to protect real
+// racers — which the note above shows it largely does not. So the cutoff was
+// buying a UI cleanup at the price of durable false DNFs on anyone who loses
+// signal for 3 minutes.
+//
+// 10min is a RISK REDUCTION, NOT THE TARGET MODEL. Under the target model socket
+// loss must never affect membership at all; that needs the eviction split into an
+// ephemeral presence signal (peers' standings) plus a durable mark at room close,
+// which is a client+server change requiring an OTA and 12/12 adoption gating —
+// removing the DNF row pre-adoption collapses checkRaceComplete's goneCount to 0
+// and freezes every un-adopted client's room permanently. Tracked separately.
+//
+// EMPTY_ROOM_TTL_MS self-derives from this and follows to 15min.
+const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
 const SERVER_GONE_GRACE_MS  = 90 * 1000;
@@ -376,7 +403,7 @@ async function hydrateRacerFromDb(roomId, room, userId, st) {
   if (!supabase) return;                                  // TEST_MODE: fully inert
   try {
     const { data: m, error } = await supabase.from('room_members')
-      .select('lifecycle, lifecycle_reason').eq('room_id', roomId).eq('user_id', userId)
+      .select('lifecycle, lifecycle_reason, lifecycle_at').eq('room_id', roomId).eq('user_id', userId)
       .eq('role', 'racer').maybeSingle();
     if (error) { log('HYDRATE read failed', roomId, userId, error.message); return; }
     if (!m || !m.lifecycle || m.lifecycle === 'active') return;
@@ -404,11 +431,20 @@ async function hydrateRacerFromDb(roomId, room, userId, st) {
     // on the client: quitUsersRef is a set.
     st.evicted = true;
     st.evictReason = m.lifecycle_reason || 'disconnect_timeout';
+    // E-13 telemetry: recover the eviction instant from the durable column, since
+    // the in-memory st.evictedAt died with the room object. mark_member_lifecycle
+    // stamps lifecycle_at in the same transaction as lifecycle, so it is the same
+    // instant evictRacer would have recorded. Null-guarded: pre-P2 rows have none.
+    const evictedAtMs = m.lifecycle_at ? new Date(m.lifecycle_at).getTime() : 0;
+    if (evictedAtMs) st.evictedAt = evictedAtMs;
     let victimWs = null;
     for (const c of room.clients) if (c.userId === userId) victimWs = c;
     broadcast(room, { event: 'racer_quit', payload: { user_id: userId, evicted: true } }, victimWs);
     if (victimWs) send(victimWs, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason } });
     log(`HYDRATE room=${roomId} user=${userId} evicted reason=${st.evictReason}`);
+    // Reaching here at all means the racer reconnected after being evicted — the
+    // same measurement the memory path emits, so one grep covers both.
+    if (evictedAtMs) log(`EVICT-RECONNECT room=${roomId} user=${userId} reason=${st.evictReason} after_ms=${Date.now() - evictedAtMs} src=hydrate`);
   } catch (e) { log('HYDRATE error', roomId, userId, e && e.message); }
 }
 
@@ -527,6 +563,10 @@ async function evictRacer(roomId, room, userId, reason) {
     if (verdict === 'room_settled' || verdict === 'no_room') return;
     if (verdict === 'already_finished') { st.finished = true; room.hasFinisher = true; return; }
     st.evicted = true; st.evictReason = reason;
+    // E-13 telemetry: stamp when the eviction landed so a later JOIN can report
+    // how long the racer was gone before coming back. In-memory only — a restart
+    // loses it, and the hydrate path recovers it from room_members.lifecycle_at.
+    st.evictedAt = Date.now();
     // P2: evict_racer_dnf already wrote the durable row; this stamps the matching
     // participant state so a restart-blind re-evict stands down at the check above.
     // The shim's upsert is GREATEST/OR on distance and dnf_final, so it can only
@@ -542,7 +582,13 @@ async function evictRacer(roomId, room, userId, reason) {
     // The other gps.delete call sites are NOT this case and stay: a kick removes
     // someone from the race entirely, and the close/disconnect paths tear the room
     // or socket down rather than marking a participant.
-    log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=${timeMs}`);
+    // E-13 telemetry: absent_ms is the ACTUAL continuous transport absence at the
+    // moment of eviction, not the configured cutoff — the two differ because the
+    // sweep runs every INACTIVITY_TICK_MS and because a fallback-progress
+    // stand-down restarts st.disconnectedAt. 0 on the stationary path, where the
+    // racer is connected; read it together with `reason`.
+    const absentMs = st.disconnectedAt ? Date.now() - st.disconnectedAt : 0;
+    log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=${timeMs} absent_ms=${absentMs}`);
     // Peers render this exactly like a quit (✕ + completion math via the DNF row);
     // the victim gets a targeted terminal instead (now, or on reconnect via JOIN).
     let victimWs = null;
@@ -903,7 +949,14 @@ wss.on('connection', async (ws, req) => {
     // never run for a live entry. A fresh entry can never be evicted yet, which
     // is why the pinned-terminal send below is the other branch, not both.
     if (fresh) void hydrateRacerFromDb(roomId, room, userId, st);
-    else if (st.evicted) send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout' } });
+    else if (st.evicted) {
+      // E-13 telemetry: the racer came back AFTER being evicted — the measurement
+      // that says whether the cutoff is DNF'ing people who were still racing.
+      // Emitted here rather than in applyEvicted because only the server knows
+      // both timestamps. Absent evictedAt (pre-upgrade state) logs nothing.
+      if (st.evictedAt) log(`EVICT-RECONNECT room=${roomId} user=${userId} reason=${st.evictReason || '?'} after_ms=${Date.now() - st.evictedAt} src=memory`);
+      send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout' } });
+    }
   }
 
   // A socket (re)joining a room that already ended must learn that immediately —
