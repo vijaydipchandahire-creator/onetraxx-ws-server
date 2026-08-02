@@ -693,7 +693,29 @@ async function maybeCompleteRace(roomId, room) {
     // rowless, which is precisely the hole the dwell term below exists to close.
     // Pre-migration (lifecycle undefined) every row is kept: identical to today.
     const members = (rawMembers || []).filter(mm => mm.lifecycle !== 'quit' && mm.lifecycle !== 'dnf');
-    if (mErr || rErr || !rawMembers || members.length === 0) return;
+    // ZERO-FINISHER GAP (fixed 2026-08-03). This guard used to read
+    // `members.length === 0`, which was correct before P2 — back then `members`
+    // WAS `rawMembers`, so an empty list meant "no roster, nothing to decide".
+    // The P2 filter above silently gave the same expression a second meaning:
+    // EVERY roster racer is terminally marked. Treating that as "nothing to
+    // decide" is exactly backwards — it is the strongest possible evidence the
+    // race is over, and bailing left the room 'racing' with nobody left to end it.
+    //
+    // Observed, not theorised: 29 prod rooms carry cancel_reason
+    // 'auto_cleanup_stale', the 3-hour cleanup_stale_rooms() cron catching what
+    // this function walked away from. Room f459f7a4 (2026-07-29) sat open 187 min
+    // with 0 ranked rows and 2 dnf rows, and the cron then stamped it 'finished' —
+    // the all-DNF 'finished' room the C5 branch below exists to make unreachable.
+    //
+    // Falling through is safe and needs no new logic: `unresolved` derives from
+    // `members`, so an all-marked roster yields an empty list and lands on the
+    // same settle branch, which already picks 'finished' vs 'cancelled' on
+    // hasFinisher. An all-dnf room therefore settles 'cancelled', per C5.
+    //
+    // The genuinely-empty roster KEEPS the old bail. A successful read returning
+    // zero rows is not evidence of completion, and settling on it would end a live
+    // race off one bad read. That case stays with the cron backstop.
+    if (mErr || rErr || !rawMembers || rawMembers.length === 0) return;
     // room.meta is otherwise populated lazily on first eviction, so targetM would be
     // undefined here in most rooms and the rowless-finisher term below could never
     // fire. Hydrate on demand; a failed read leaves targetM 0, which disables that
@@ -729,22 +751,30 @@ async function maybeCompleteRace(roomId, room) {
       return !(st && !st.connected && st.disconnectedAt && now - st.disconnectedAt >= SERVER_GONE_GRACE_MS);
     });
     if (unresolved.length) return;
+    // Distinguish the zero-finisher-gap path in the log: an EMPTY `members` means
+    // every roster racer was terminally marked, which is the case that used to
+    // bail out above and reach the 3-hour cron instead. `all_marked` in a
+    // SERVER-COMPLETE line is this fix firing; its absence is the ordinary path.
+    const allMarked = members.length === 0;
     if (hasFinisher) {
       // Status CAS (same guard as maybeServerFinalize): exactly one settler wins;
       // deliver the terminal only if WE won, so reasons never conflict.
       const won = await settleRoom(roomId, 'finished', 'all_done');
       if (won === null) { log('SERVER-COMPLETE failed', roomId); return; }
       if (settleWon(won)) {
-        log(`SERVER-COMPLETE room=${roomId}`);
+        log(`SERVER-COMPLETE room=${roomId}${allMarked ? ' all_marked' : ''}`);
         deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
       }
     } else {
       // C5: zero finishers → a race with no outcome is 'cancelled', never an
-      // all-DNF 'finished'.
+      // all-DNF 'finished'. Reason stays 'inactivity_abandon': it is the
+      // established zero-finisher terminal and clients short-circuit their stats
+      // path on it, which is the correct behaviour for an all-DNF room too. A
+      // truer reason would be a new string every client would have to learn.
       const won = await settleRoom(roomId, 'cancelled', 'inactivity_abandon');
       if (won === null) { log('SERVER-COMPLETE cancel failed', roomId); return; }
       if (settleWon(won)) {
-        log(`SERVER-COMPLETE (no finishers → cancelled) room=${roomId}`);
+        log(`SERVER-COMPLETE (no finishers → cancelled) room=${roomId}${allMarked ? ' all_marked' : ''}`);
         deliverTerminal(room, roomId, { reason: 'inactivity_abandon' });
       }
     }
