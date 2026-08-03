@@ -28,6 +28,56 @@ const BUILD_INFO = (() => {
   };
 })();
 
+// ── D-08 (2026-08-03): optional server-side Sentry ───────────────────────────
+// THE SOFT REQUIRE IS THE WHOLE DESIGN — do not "clean it up" into a normal
+// top-level require. deploy.sh ships server.js and NOTHING ELSE; it has never
+// installed dependencies, and its step-4 guard is `node --check`, a SYNTAX check
+// that does not resolve require(). A hard require for a module the VM has not
+// installed would therefore pass every gate in the deploy script and then crash
+// the process at boot, leaving only the `pm2 jlist` online-grep between a deploy
+// and a dead relay. The two ends also install differently and can legitimately be
+// out of step: the Oracle VM is hand-run `npm install` on Node 20, ws-backup is
+// Render `buildCommand: npm install` on Node 26.
+//
+// With the soft require, DEPLOY ORDER STOPS MATTERING and either end may run
+// without the module — it degrades to exactly today's behaviour (PM2 logs only).
+// That is what lets this land and deploy BEFORE the dependency exists anywhere.
+//
+// Gated on SENTRY_DSN as well, so an environment without a DSN — TEST_MODE,
+// a fresh box, a local run — is fully inert rather than merely quiet.
+//
+// The release is the source fingerprint the health endpoint already exposes, so
+// a Sentry event names the exact deployed file and lines up with the drift check.
+let Sentry = null;
+try {
+  if (process.env.SENTRY_DSN) {
+    Sentry = require('@sentry/node');
+    Sentry.init({
+      dsn: process.env.SENTRY_DSN,
+      environment: process.env.SENTRY_ENV || 'production',
+      release: BUILD_INFO.src_sha256 ? `ws@${BUILD_INFO.src_sha256.slice(0, 12)}` : undefined,
+      // Errors only. This process is a hot relay on a free-tier-adjacent box;
+      // performance tracing would add per-message overhead for no current need.
+      tracesSampleRate: 0,
+    });
+  }
+} catch (e) {
+  // Module absent, or init threw. Either way the server keeps running exactly as
+  // it does today — this must never be the reason a race server fails to boot.
+  console.error('[sentry] disabled:', e && e.message);
+  Sentry = null;
+}
+
+// Never throws, never blocks. Same contract as markLifecycle: a failure here
+// degrades to "no event was sent", which is the pre-D-08 state.
+function captureServer(err, ctx) {
+  if (!Sentry) return;
+  try {
+    Sentry.captureException(err instanceof Error ? err : new Error(String(err)),
+      ctx ? { extra: ctx } : undefined);
+  } catch (_) {}
+}
+
 // @supabase/supabase-js builds a RealtimeClient on createClient(), which needs a
 // global WebSocket. Node < 22 has none, so expose the one from `ws`. This server
 // doesn't use Supabase Realtime (only token validation), but createClient throws
@@ -1195,6 +1245,7 @@ wss.on('connection', async (ws, req) => {
       // the process (which would drop every room). Log type + error; never silent.
       log(`MESSAGE-DISPATCH error user=${ws.userId} room=${ws.roomId} event=${(msg && msg.event) || '?'} err=${e && e.message}`);
       if (e && e.stack) console.error(e.stack);
+      captureServer(e, { guard: 'dispatch', event: (msg && msg.event) || '?', room_id: ws.roomId });  // D-08
     }
   });
 
@@ -1270,6 +1321,7 @@ const batchTimer = setInterval(() => {
   } catch (e) {
     log(`SWEEP error timer=batch err=${e && e.message}`);
     if (e && e.stack) console.error(e.stack);
+    captureServer(e, { guard: 'sweep', timer: 'batch' });     // D-08
   }
 }, BATCH_INTERVAL_MS);
 
@@ -1366,6 +1418,7 @@ const inactivityTimer = setInterval(() => {
   } catch (e) {
     log(`SWEEP error timer=inactivity err=${e && e.message}`);
     if (e && e.stack) console.error(e.stack);
+    captureServer(e, { guard: 'sweep', timer: 'inactivity' }); // D-08
   }
 }, INACTIVITY_TICK_MS);
 
@@ -1385,6 +1438,7 @@ const pingTimer = setInterval(() => {
   } catch (e) {
     log(`SWEEP error timer=ping err=${e && e.message}`);
     if (e && e.stack) console.error(e.stack);
+    captureServer(e, { guard: 'sweep', timer: 'ping' });      // D-08
   }
 }, PING_INTERVAL_MS);
 
@@ -1420,6 +1474,23 @@ process.on('uncaughtException', (err, origin) => {
   // the structured context the raw crash never logged.
   try { log(`FATAL uncaughtException origin=${origin} name=${err && err.name} msg=${err && err.message}`); } catch (_) {}
   if (err && err.stack) { try { console.error(err.stack); } catch (_) {} }
+  // D-08: this is the ONE capture that cannot use the fire-and-forget helper —
+  // the process is about to exit, and an unflushed event is simply lost. Sentry
+  // is given a bounded 1500 ms to ship it, then we exit regardless.
+  //
+  // ⚠️ THIS DELAYS THE EXIT, which the comment above deliberately wants prompt
+  // ("the safe move is a clean exit + PM2 restart, NOT limping on in an unknown
+  // state"). 1500 ms is the compromise: long enough for one HTTPS round trip,
+  // short against PM2's own restart time, and it only ever applies on a crash
+  // that is already fatal. Both settle paths exit 1 — a flush that fails must
+  // never turn a crash into a hang.
+  if (Sentry) {
+    try {
+      Sentry.captureException(err, { tags: { origin }, level: 'fatal' });
+      Sentry.close(1500).then(() => process.exit(1), () => process.exit(1));
+      return;
+    } catch (_) {}
+  }
   process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
@@ -1429,5 +1500,6 @@ process.on('unhandledRejection', (reason) => {
     const r = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
     log(`unhandledRejection (non-fatal, kept running) reason=${r}`);
     if (reason instanceof Error && reason.stack) console.error(reason.stack);
+    captureServer(reason, { guard: 'unhandledRejection' });   // D-08
   } catch (_) {}
 });
