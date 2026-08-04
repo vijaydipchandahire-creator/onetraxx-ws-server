@@ -2,6 +2,10 @@ services:
   - type: web
     name: onetraxx-ws-backup
     runtime: node
+    # Node version is pinned in .node-version (20.20.2), matching the primary VM.
+    # Do not rely on engines.node alone -- it was ">=18", a floor, so Render kept
+    # installing the newest major and the runtime drifted v26.5.1 -> v26.6.0 on an
+    # unrelated redeploy (2026-08-04). A failover must not land on an untested runtime.
     plan: free
     region: oregon
     buildCommand: npm install
