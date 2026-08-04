@@ -3,9 +3,17 @@ services:
     name: onetraxx-ws-backup
     runtime: node
     # Node version is pinned in .node-version (20.20.2), matching the primary VM.
-    # Do not rely on engines.node alone -- it was ">=18", a floor, so Render kept
-    # installing the newest major and the runtime drifted v26.5.1 -> v26.6.0 on an
-    # unrelated redeploy (2026-08-04). A failover must not land on an untested runtime.
+    # That file is the ONLY lever here. Before it existed the runtime was governed
+    # by engines.node ">=18" -- a floor, not a pin -- so Render installed the newest
+    # major and it drifted v26.5.1 -> v26.6.0 on an unrelated redeploy (2026-08-04).
+    # A failover must not land on an untested runtime.
+    #
+    # engines.node is DELIBERATELY left as ">=18". Tightening it to an exact version
+    # desyncs package.json from package-lock.json, so npm rewrites the lockfile during
+    # the Render build and the deployed lock_sha256 stops matching the committed file
+    # -- which is exactly what the drift check reads. Measured 2026-08-04: the lock
+    # went 8d7e8cbd -> 6664ad7d until engines was reverted. Pin the runtime here,
+    # never through engines.
     plan: free
     region: oregon
     buildCommand: npm install
