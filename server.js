@@ -1193,7 +1193,18 @@ wss.on('connection', async (ws, req) => {
         // have left the HUD, so the server must be able to settle).
         if (event === 'finished' || event === 'racer_quit') {
           const st = room.racers.get(ws.userId);
-          if (st) {
+          // E-12: terminal state is first-write-wins. This was the only writer of
+          // the three terminal flags with no guard — hydrateRacerFromDb and
+          // evictRacer both check first — so a 'finished' relay followed by a
+          // 'racer_quit' left st.finished and st.quit BOTH true, the one thing
+          // every reader below assumes is exclusive.
+          // Not a new rule: mark_member_lifecycle already refuses exactly this
+          // downgrade in the DB (v_cur='finished' -> 'noop'), and that column is
+          // what hydrateRacerFromDb rebuilds from after a restart. This aligns the
+          // in-memory cache with the authority it is a cache OF.
+          // A repeat 'finished' relay is unaffected: it was already idempotent via
+          // the finishedAt check below, and st.finished is already true.
+          if (st && !st.finished && !st.quit && !st.evicted) {
             if (event === 'finished') {
               // finishedAt stamps the FIRST witnessed finish only, so the dwell window
               // cannot be reset by a repeat relay (handleFinish resends on a landed
