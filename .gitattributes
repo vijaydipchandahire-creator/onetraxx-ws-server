@@ -1,2 +1,7 @@
 server.js text eol=lf
 .node-version text eol=lf
+# /health reports lock_sha256 as a hash of this file's RAW bytes, so a CRLF
+# checkout changes the fingerprint without changing a single dependency. That is
+# the value the primary/backup drift check compares, so an unpinned lockfile
+# makes real drift indistinguishable from line-ending noise.
+package-lock.json text eol=lf

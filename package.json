@@ -11,6 +11,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@sentry/node": "10.69.0",
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
