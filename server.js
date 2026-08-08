@@ -1021,7 +1021,17 @@ wss.on('connection', async (ws, req) => {
       room.racers.set(userId, st);
     }
     st.connected = true; st.disconnectedAt = 0; st.goneNotified = false;
-    st.lastMoveTs = Date.now();                 // reconnect re-seeds the stationary clock
+    // The stationary clock deliberately SURVIVES a reconnect. It used to be
+    // re-seeded here, which handed any racer whose transport flapped a fresh
+    // 10 minutes on every rejoin: observed 2026-08-08 in room 78113077, where an
+    // iOS racer stood still for 12m26s and was never evicted because a 1006 drop
+    // at 06:08:54 and a rejoin at 06:09:38 restarted the clock 6 minutes in.
+    // Preserving it is safe in the other direction too — absence of frames is not
+    // evidence of movement, and the first frame at/above STATIONARY_KMH resets
+    // the clock immediately, so a racer who really was running is never evicted
+    // for the gap. A racer who is genuinely gone is governed by REQ1's
+    // disconnect clock during that same window.
+    if (fresh) st.lastMoveTs = Date.now();
     // E-11: an ABSENT entry means either a genuine first join or a room object
     // this server lost (restart / GC) — only the DB can tell those apart, so ask
     // it. When `st` already existed, memory is the NEWER record (the finished /
