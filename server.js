@@ -139,6 +139,57 @@ const RACE_INACTIVITY_WARN_MS = 60 * 1000;       // countdown shown before aband
 const INACTIVITY_TICK_MS      = 5000;            // sweep cadence
 const STATIONARY_KMH          = 0.8;             // == 0.222 m/s (client stall gate)
 
+// ── R-61: the server owns the distance ───────────────────────────────────────
+//
+// 🔑 THE DEFECT THIS CLOSES. `gps` used to buffer `payload.distance_m` verbatim —
+// no lower bound, no displacement cap, no comparison against elapsed time. Every
+// other anti-cheat layer in this product inspects SENSOR HONESTY on the device
+// (T8 steps, R-11's mock-provider verdict, the whole T7 filter chain), so all of
+// them are bypassed completely by a client that never uses its sensors and simply
+// asserts a distance. The finish-time guards do not catch it either:
+// assign_race_position asks for >= 90% of target (a forged full distance satisfies
+// it) and an average speed within cap x 1.5 (a forged distance over the real
+// elapsed time is entirely plausible). One forged frame won the race.
+//
+// The fix is the model Strava uses and the one this server should always have had:
+// the client reports, the SERVER decides. Each frame may advance a racer by at most
+// what the activity's speed cap allows for the time that has actually passed.
+//
+// 🔑 THE BUDGET IS MEASURED IN ELAPSED WALL TIME, NOT PER MESSAGE. This is the
+// single most important property here and it is the same lesson as the §4e delivery
+// clock on the client. A per-message cap would trim the honest catch-up of a racer
+// returning from a signal drop or an Android delivery batch — punishing the WORST
+// connection hardest, and (because a stalled distance is what the stationary
+// eviction watches) eventually DNF-ing them. Budgeting on elapsed time means a
+// 3-minute tunnel legitimately buys 3 minutes of catch-up, while an instant jump
+// 5 seconds into the race buys 5 seconds' worth.
+//
+// ⚠️ THREE SAFETY PROPERTIES, all of them about not harming honest racers:
+//   1. TRIM, NEVER REJECT. A frame over budget is admitted at the ceiling, not
+//      dropped. Dropping would freeze the racer's progress entirely.
+//   2. NEVER GO BACKWARDS. The accepted distance is monotone, so a trim can never
+//      reduce a racer below ground already granted (which would read as "no
+//      progress" and route them to eviction — the exact cost the cheat has).
+//   3. ABSTAIN WHILE UNINFORMED. Until the room's activity type and start time are
+//      known, nothing is trimmed. An unknown room is treated as honest.
+//
+// Caps mirror the client's SPORT_SPEED_CAPS with the same x1.5 margin
+// assign_race_position uses, so nothing here is stricter than a check that has
+// already been live for a year.
+const SERVER_DISTANCE_BUDGET = true;             // kill switch — restart to revert
+const BUDGET_SPEED_CAPS_KMH  = { running: 50, cycling: 100, walking: 20, swimming: 10 };
+const BUDGET_MARGIN          = 1.5;              // matches assign_race_position
+const BUDGET_UNKNOWN_CAP_KMH = 100;              // most permissive, used pre-hydration
+// A frame may always advance this far regardless of dt, so that clock skew or a
+// sub-second tick can never trim a legitimate GPS step to nothing.
+const BUDGET_FLOOR_M         = 25;
+
+// ── R-64 Part 3, PHASE 1: stamp the crossing. MEASUREMENT ONLY ───────────────
+// Writes race_crossings when a racer's ACCEPTED distance first reaches the target.
+// Nothing reads it; no client behaviour, no ranking, no eviction depends on it.
+// See supabase/sql/20260814_r64p3_crossing_measure.sql for why it is a phase.
+const SERVER_CROSSING_STAMP = true;              // kill switch — restart to revert
+
 // ── Per-racer eviction policy (2026-07-12, PROPOSAL_DNF_EVICTION_POLICY.md) ──
 // REQ1: a racer whose transport is absent for 10 CONTINUOUS minutes is evicted
 // (durable DNF via evict_racer_dnf). Any reconnect clears the clock, so
@@ -260,6 +311,10 @@ function getRoom(roomId) {
   let room = rooms.get(roomId);
   if (!room) {
     room = { clients: new Set(), gps: new Map(), dirty: false,
+             // R-61: carried so the budget's trim log can name the room. Every other
+             // consumer already had roomId in scope; budgetedDistance is pure and
+             // does not.
+             id: roomId,
              raceActive: false, lastMovementTs: 0, inactivityWarnDeadline: 0,
              // Eviction policy: per-racer lifecycle, keyed by userId.
              // { connected, disconnectedAt, lastMoveTs, lastDist, baselineDist,
@@ -681,6 +736,140 @@ async function maybeWarnStationary(roomId, room, userId, st) {
   finally { st.warnChecking = false; }
 }
 
+// ── R-61 helpers ─────────────────────────────────────────────────────────────
+//
+// Hydrates room.meta with what the budget needs. Fire-and-forget on purpose: the
+// gps handler must never await, so the FIRST few frames of a race are evaluated
+// with no meta and are therefore admitted untrimmed. That is the correct trade —
+// this is a cheat mitigation, not an authorisation gate, and the alternative
+// (blocking the hot path on a network read) would cost every honest racer.
+//
+// `activity_type` is new to this read; the other two fields match the two existing
+// lazy hydrations, so a room already hydrated by one of those is re-read once to
+// pick the activity up. Guarded by metaFetching so a burst of frames triggers one
+// request, not one per frame.
+async function ensureBudgetMeta(roomId, room) {
+  if (!supabase || room.metaFetching) return;
+  if (room.meta && room.meta.activity !== undefined) return;
+  room.metaFetching = true;
+  try {
+    const { data: r } = await supabase
+      .from('race_rooms').select('started_at, target_distance_m, activity_type')
+      .eq('id', roomId).single();
+    if (r) {
+      room.meta = { startedAt: r.started_at, targetM: r.target_distance_m,
+                    activity: r.activity_type || null };
+    }
+  } catch (e) { log('BUDGET-META error', roomId, e && e.message); }
+  finally { room.metaFetching = false; }
+}
+
+// Returns the distance this racer may be credited with, given what they claim.
+// Pure apart from the two fields it advances on `st`, so the policy above can be
+// reasoned about (and changed) without touching the message handler.
+function budgetedDistance(room, st, claimed, now) {
+  const raw = (typeof claimed === 'number' && Number.isFinite(claimed) && claimed >= 0)
+    ? claimed : (st.acceptedDist || 0);
+
+  if (!SERVER_DISTANCE_BUDGET) return raw;
+
+  // Anchor the clock the first time we see this racer. Preferring the room's start
+  // over `now` is what stops the very first frame being a free teleport: a racer
+  // whose first frame lands 4 minutes into the race gets 4 minutes of budget, not
+  // an unbounded seed. A racer reconnecting keeps whatever they had already earned
+  // (st.acceptedDist survives on the room state, and the DB baseline seeds it on
+  // rejoin), so a reconnect is not a fresh start either.
+  if (st.acceptedTs == null) {
+    const startedAt = room.meta && room.meta.startedAt
+      ? new Date(room.meta.startedAt).getTime() : null;
+    st.acceptedTs = (startedAt && startedAt <= now) ? startedAt : now;
+    st.acceptedDist = Math.max(st.acceptedDist || 0, st.lastDist || 0, st.baselineDist || 0);
+  }
+
+  // ABSTAIN: the activity is not known yet (hydration in flight, or the read
+  // failed). Trimming on the unknown-room default would apply a cycling ceiling to
+  // a walking race, which is meaningless, so admit and let hydration catch up.
+  const activity = room.meta && room.meta.activity;
+  const capKmh = activity ? (BUDGET_SPEED_CAPS_KMH[activity] || BUDGET_UNKNOWN_CAP_KMH)
+                          : BUDGET_UNKNOWN_CAP_KMH;
+
+  const dtMs = Math.max(0, now - st.acceptedTs);
+  const allowanceM = (capKmh * BUDGET_MARGIN) * (dtMs / 3600000) * 1000;
+  const ceiling = (st.acceptedDist || 0) + Math.max(BUDGET_FLOOR_M, allowanceM);
+
+  // Monotone by construction: max() against the distance already granted, so a
+  // client that regresses (or a trim) can never push a racer backwards into the
+  // stationary-eviction path.
+  let accepted = Math.max(st.acceptedDist || 0, Math.min(raw, ceiling));
+
+  // The race cannot be longer than the race. Clamping here mirrors
+  // save_race_result's own clamp, so the number peers see, the number the eviction
+  // logic reads and the number the finish stores cannot disagree.
+  const targetM = room.meta && room.meta.targetM;
+  if (targetM > 0) accepted = Math.min(accepted, targetM);
+
+  if (raw > accepted + 1) {
+    st.trimmed = (st.trimmed || 0) + 1;
+    st.trimmedM = Math.round((st.trimmedM || 0) + (raw - accepted));
+    // One line per trim is too noisy at GPS cadence on a flapping connection; log
+    // the first, then every 20th, which is enough to see a sustained forgery.
+    if (st.trimmed === 1 || st.trimmed % 20 === 0) {
+      log(`BUDGET-TRIM room=${room.id || '?'} claimed=${Math.round(raw)} accepted=${Math.round(accepted)} ` +
+          `dt=${dtMs}ms cap=${capKmh}km/h act=${activity || 'unknown'} n=${st.trimmed}`);
+    }
+  }
+
+  st.acceptedDist = accepted;
+  st.acceptedTs = now;
+  return accepted;
+}
+
+// R-64 Part 3, phase 1. Record the instant the ACCEPTED distance first reached the
+// target — the thing finish_time_ms was supposed to be and is not.
+//
+// 🔑 THIS RELAY CAN SEE THE CROSSING THE STALLED CLIENT CANNOT REPORT. That is the
+// whole basis of Part 3 and it is measured, not assumed: 2026-08-14 room 194d825e,
+// peers rendered tina_p at 0.50 km from 11:50:46 while her finish row did not land
+// until 11:52:54. The frames kept arriving here throughout — the seed hang blocks
+// the FINISH path, not the GPS path.
+//
+// Deliberately NOT a promise anyone awaits, and it swallows its own errors: a
+// measurement must never cost a frame on the 1 Hz hot path, and must never be able
+// to fail a race. If the write is lost, the measurement is lost — nothing else.
+function recordCrossing(roomId, room, st, userId, accepted) {
+  if (!SERVER_CROSSING_STAMP || !supabase) return;
+  if (st.crossingStamped) return;
+  const targetM = room.meta && room.meta.targetM;
+  // ABSTAIN while the target is unknown (hydration in flight) — same rule the
+  // budget follows. A crossing cannot happen before hydration on any real race.
+  if (!(targetM > 0) || !(accepted >= targetM)) return;
+  const startedAt = room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : null;
+  if (!startedAt) return;                 // no anchor, no comparable elapsed
+  st.crossingStamped = true;              // set BEFORE the await: at 1 Hz the next
+                                          // frame arrives long before the insert.
+  const now = Date.now();
+  // baseline: this racer was already over the line on their first frame of this
+  // connection, so the real crossing happened where we could not see it. Marked,
+  // never silently treated as a crossing — correcting a rank on one would hand a
+  // place to whoever's socket survived, which is the opposite of the fix.
+  const source = (st.baselineDist || 0) >= targetM ? 'baseline' : 'live';
+  const elapsed = Math.max(0, now - startedAt);
+  log(`CROSSING room=${roomId} user=${userId} elapsed=${elapsed}ms ` +
+      `accepted=${Math.round(accepted)} target=${targetM} source=${source}`);
+  supabase.from('race_crossings').insert({
+    room_id: roomId, user_id: userId,
+    crossed_at: new Date(now).toISOString(),
+    crossed_elapsed_ms: elapsed,
+    accepted_m: Math.round(accepted),
+    target_m: targetM,
+    source,
+  }).then(({ error }) => {
+    // 23505 = the earliest observation already landed, which is the intended
+    // outcome of a reconnect and not a problem worth a line.
+    if (error && error.code !== '23505') log('CROSSING write failed', roomId, error.message);
+  }, (e) => log('CROSSING write threw', roomId, e && e.message));
+}
+
 // Debounced server-side completion check. Exists because finishers may leave
 // the HUD (REQ3) — with no client left to run checkRaceComplete, the server
 // must settle the room. Semantics mirror the client: complete when every
@@ -1017,7 +1206,12 @@ wss.on('connection', async (ws, req) => {
     if (!st) {
       st = { connected: true, disconnectedAt: 0, lastMoveTs: Date.now(), lastDist: 0,
              baselineDist: 0, warnDeadline: 0, finished: false, quit: false,
-             evicted: false, goneNotified: false, evicting: false, warnChecking: false };
+             evicted: false, goneNotified: false, evicting: false, warnChecking: false,
+             // R-61 budget. acceptedTs stays null until the first frame so the
+             // anchor can be the race start rather than the moment of joining —
+             // seeding it here would hand a late joiner a full-race allowance in
+             // one frame.
+             acceptedDist: 0, acceptedTs: null, trimmed: 0, trimmedM: 0 };
       room.racers.set(userId, st);
     }
     st.connected = true; st.disconnectedAt = 0; st.goneNotified = false;
@@ -1095,9 +1289,21 @@ wss.on('connection', async (ws, req) => {
         if (ws.role !== 'racer') return; // only racers contribute positions
         const st = room.racers.get(ws.userId);
         if (st && st.evicted) return;    // evicted racers no longer feed the room
+        // ── R-61: the distance the room sees is the SERVER's, not the client's ──
+        // Everything downstream — the peer fanout, the eviction progress test, the
+        // quit/DNF distance and the finish-time re-read — reads from here, so this
+        // single substitution is what makes the budget authoritative rather than
+        // advisory. Racers with no state row (should not happen on a live race)
+        // fall through to the claimed value, exactly as before.
+        const nowTs = Date.now();
+        if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
+        const distM = st ? budgetedDistance(room, st, payload.distance_m, nowTs)
+                         : payload.distance_m;
+        // R-64 Part 3 phase 1 — measurement only, changes nothing below it.
+        if (st) recordCrossing(roomId, room, st, ws.userId, distM);
         room.gps.set(ws.userId, {
           user_id: ws.userId,
-          distance_m: payload.distance_m,
+          distance_m: distM,
           speed_kmh: payload.speed_kmh,
           ts: payload.ts || Date.now(),
         });
@@ -1117,7 +1323,13 @@ wss.on('connection', async (ws, req) => {
         // server receives — speed at/above the stall gate OR the accumulated
         // distance advancing (so a forged speed field alone is not the signal).
         if (st) {
-          const d = typeof payload.distance_m === 'number' ? payload.distance_m : 0;
+          // R-61: judged on the ACCEPTED distance, not the claimed one — otherwise a
+          // forged frame would still reset the stationary clock and a cheat could
+          // sit out an entire race without ever being evicted. The speed term is
+          // deliberately left reading the client's field: it is the honest racer's
+          // protection against a trim stalling their progress, and on its own it can
+          // only ever KEEP someone in a race, never advance their position.
+          const d = typeof distM === 'number' ? distM : 0;
           const moved = (typeof payload.speed_kmh === 'number' && payload.speed_kmh >= STATIONARY_KMH)
                         || d > (st.lastDist || 0) + 2;
           if (d > (st.lastDist || 0)) st.lastDist = d;
