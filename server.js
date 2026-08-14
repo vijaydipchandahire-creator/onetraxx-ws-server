@@ -227,6 +227,30 @@ const SERVER_CROSSING_STAMP = true;              // kill switch — restart to r
 // and freezes every un-adopted client's room permanently. Tracked separately.
 //
 // EMPTY_ROOM_TTL_MS self-derives from this and follows to 15min.
+// ── R-49: server-authoritative presence ──────────────────────────────────────
+// The client's red 'waiting…' verdict is derived purely from broadcast age, and
+// Android's screen-off freeze stops both location delivery AND every JS timer —
+// so no client-side mechanism (R-42's heartbeat included) can emit during the
+// hole it is supposed to report on. THE SERVER ALREADY HOLDS THE FACT: measured
+// room 75df90af, the socket stayed open through 2-10 min stall episodes (one
+// JOIN, no 1006, LEAVE 1000 at race end). This publishes that fact so clients
+// can distinguish 'socket open, no data' (frozen/batching: neutral no-signal
+// state) from 'socket closed' (the existing REQ1 eviction clock).
+//
+// ⚠️ 'conn: true' IS NOT 'alive'. A connected-but-silent racer is still governed
+// by the REQ2 stationary eviction (10 min + 60 s warn) — presence changes how
+// peers RENDER the gap, never whether the server acts on it. Purely additive:
+// old clients drop unknown events on their default case, so this deploys ahead
+// of any OTA and is inert until a client opts in.
+//
+// PRESENCE-GAP / PRESENCE-RESUME log lines are the device-test readout for the
+// R-49 precondition (does a freeze longer than 10 min keep the socket open?):
+// one line when a connected racer's data gap first exceeds the threshold, one on
+// resume with the episode length. Bounded to one pair per episode.
+const SERVER_PRESENCE       = true;              // kill switch — restart to revert
+const PRESENCE_INTERVAL_MS  = 5000;              // fan-out cadence (client frozen gate is 30s)
+const PRESENCE_GAP_LOG_MS   = 30000;             // episode logging threshold = client's GPS_FROZEN_MS
+
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
@@ -1222,6 +1246,9 @@ wss.on('connection', async (ws, req) => {
       st = { connected: true, disconnectedAt: 0, lastMoveTs: Date.now(), lastDist: 0,
              baselineDist: 0, warnDeadline: 0, finished: false, quit: false,
              evicted: false, goneNotified: false, evicting: false, warnChecking: false,
+             // R-49: last moment ANY gps frame arrived from this racer on this
+             // socket, and whether the current silent episode has been logged.
+             lastDataTs: Date.now(), gapLogged: false,
              // R-61 budget. acceptedTs stays null until the first frame so the
              // anchor can be the race start rather than the moment of joining —
              // seeding it here would hand a late joiner a full-race allowance in
@@ -1230,6 +1257,9 @@ wss.on('connection', async (ws, req) => {
       room.racers.set(userId, st);
     }
     st.connected = true; st.disconnectedAt = 0; st.goneNotified = false;
+    // R-49: a JOIN is data. Without this, a reconnect after a long freeze would
+    // immediately re-log a gap that the reconnect itself has ended.
+    st.lastDataTs = Date.now(); st.gapLogged = false;
     // The stationary clock deliberately SURVIVES a reconnect. It used to be
     // re-seeded here, which handed any racer whose transport flapped a fresh
     // 10 minutes on every rejoin: observed 2026-08-08 in room 78113077, where an
@@ -1311,6 +1341,15 @@ wss.on('connection', async (ws, req) => {
         // advisory. Racers with no state row (should not happen on a live race)
         // fall through to the claimed value, exactly as before.
         const nowTs = Date.now();
+        // R-49: any gps frame ends a silent episode. Log the resume side of the
+        // pair BEFORE refreshing the stamp, so the episode length is the truth.
+        if (st) {
+          if (st.gapLogged) {
+            log(`PRESENCE-RESUME room=${roomId} user=${ws.userId} gap_ms=${nowTs - st.lastDataTs}`);
+            st.gapLogged = false;
+          }
+          st.lastDataTs = nowTs;
+        }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
         const distM = st ? budgetedDistance(room, st, payload.distance_m, nowTs)
                          : payload.distance_m;
@@ -1573,6 +1612,47 @@ const batchTimer = setInterval(() => {
   }
 }, BATCH_INTERVAL_MS);
 
+// ── R-49: presence fan-out ───────────────────────────────────────────────────
+// Deliberately its OWN timer, not a rider on the gps batch: the batch is gated
+// on room.dirty, so a fully frozen room sends nothing — which is precisely the
+// moment presence must still flow. One small message per active room per 5 s.
+// gap_ms is measured on THIS server's clock (immune to any client freeze).
+// Terminal/evicted/quit/finished racers are included with their flags so the
+// consuming client never has to guess why someone went silent.
+const presenceTimer = setInterval(() => {
+  if (!SERVER_PRESENCE) return;
+  // M-3: contain a throw so one bad room can't kill every room's presence.
+  try {
+    const now = Date.now();
+    for (const [roomId, room] of rooms) {
+      if (room.terminal || !room.raceActive || room.clients.size === 0) continue;
+      if (room.racers.size === 0) continue;
+      const racers = [];
+      for (const [uid, st] of room.racers) {
+        racers.push({
+          id: uid,
+          conn: !!st.connected,
+          gap_ms: st.connected ? Math.max(0, now - (st.lastDataTs || now)) : null,
+          fin: !!st.finished, quit: !!st.quit, evict: !!st.evicted,
+        });
+        // Device-test readout: one PRESENCE-GAP line per silent episode of a
+        // CONNECTED racer (the disconnected case already logs LEAVE + the REQ1
+        // clock). The matching PRESENCE-RESUME is logged by the gps handler.
+        if (st.connected && !st.finished && !st.quit && !st.evicted && !st.gapLogged
+            && st.lastDataTs && now - st.lastDataTs >= PRESENCE_GAP_LOG_MS) {
+          st.gapLogged = true;
+          log(`PRESENCE-GAP room=${roomId} user=${uid} gap_ms=${now - st.lastDataTs}`);
+        }
+      }
+      broadcast(room, { event: 'presence', payload: { racers, ts: now } });
+    }
+  } catch (e) {
+    log(`SWEEP error timer=presence err=${e && e.message}`);
+    if (e && e.stack) console.error(e.stack);
+    captureServer(e, { guard: 'sweep', timer: 'presence' });   // D-08
+  }
+}, PRESENCE_INTERVAL_MS);
+
 // ── Racer lifecycle sweep (extends the old inactivity sweep) ─────────────────
 // Ordering per room, per tick, IS the timer-precedence rule:
 //   1. GC empty rooms kept alive for eviction timers, once settled/aged out.
@@ -1699,6 +1779,7 @@ server.listen(PORT, () => {
 function shutdown(signal) {
   log(`${signal} received — shutting down.`);
   clearInterval(batchTimer);
+  clearInterval(presenceTimer);   // R-49
   clearInterval(pingTimer);
   clearInterval(inactivityTimer);
   for (const ws of allClients) {
