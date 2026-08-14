@@ -750,7 +750,22 @@ async function maybeWarnStationary(roomId, room, userId, st) {
 // request, not one per frame.
 async function ensureBudgetMeta(roomId, room) {
   if (!supabase || room.metaFetching) return;
-  if (room.meta && room.meta.activity !== undefined) return;
+  // 🔑 started_at IS NULL UNTIL THE RACE STARTS, AND THIS CACHE USED TO KEEP THAT
+  // NULL FOREVER. Frames flow before the start (gps_ready in the lobby, and any
+  // window where the start write is slow), so the first fetch can legitimately
+  // land on a not-yet-started room. Caching that made room.meta.startedAt null
+  // for the whole race, which silently disabled recordCrossing's anchor — found
+  // on device 2026-08-14, room EMU_R64_3: racer3 finished 500 m and NO crossing
+  // row was written, because the meta had been cached during a stalled start.
+  // Keep re-reading while the anchor is missing, at most every 10s so a lobby
+  // sitting at 1 Hz does not turn into a request per frame.
+  const haveAnchor = room.meta && room.meta.activity !== undefined && room.meta.startedAt;
+  if (haveAnchor) return;
+  if (room.meta && room.meta.activity !== undefined) {
+    const now = Date.now();
+    if (room.metaRetryAt && now < room.metaRetryAt) return;
+    room.metaRetryAt = now + 10000;
+  }
   room.metaFetching = true;
   try {
     const { data: r } = await supabase
