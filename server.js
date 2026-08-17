@@ -251,6 +251,23 @@ const SERVER_PRESENCE       = true;              // kill switch — restart to r
 const PRESENCE_INTERVAL_MS  = 5000;              // fan-out cadence (client frozen gate is 30s)
 const PRESENCE_GAP_LOG_MS   = 30000;             // episode logging threshold = client's GPS_FROZEN_MS
 
+// ── Phase 3 SHADOW MODE (2026-08-18) — server-side distance scoring ─────────
+// Clients piggyback raw GPS fixes (payload.fx = [[ts, lat, lng, acc, spd], …],
+// replayed background fixes included) on the existing 'gps' message. The server
+// scores them through ONE deterministic pipeline per racer and, at room
+// terminal, records {raw_m, cred_m, client_m, …} in race_shadow_distance plus a
+// SHADOW log line. Nothing downstream reads any of it — the room still runs
+// entirely on the client-credited (R-61-budgeted) distance. The point is a
+// week of real races measuring client-vs-server deltas BEFORE the server
+// number ever becomes authoritative. v1 gates are deliberately minimal
+// (accuracy / ordering / teleport): the client's stationary/deadband gates are
+// the ones under investigation, so the shadow must NOT replicate them.
+const SERVER_SHADOW_DISTANCE   = true;   // kill switch — restart to revert
+const SHADOW_MAX_FX_PER_MSG    = 120;    // per-message cap (client sends ≤120)
+const SHADOW_MAX_FIXES         = 14400;  // per racer (~4h at 1/s) — memory bound
+const SHADOW_MAX_ACC_M         = 40;     // worse accuracy contributes nothing
+const SHADOW_TELEPORT_MPS      = 15;     // >54 km/h chord speed = re-anchor, no credit
+
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
@@ -380,6 +397,7 @@ function broadcast(room, message, exceptWs) {
 function deliverTerminal(room, roomId, payload, exceptWs) {
   room.terminal = { payload, mid: `${roomId}:${Date.now()}` };
   log(`TERMINAL room=${roomId} reason=${payload && payload.reason}`);
+  flushShadow(roomId, room, 'terminal');
   for (const client of room.clients) {
     if (client === exceptWs) continue;
     sendTerminalWithRetry(room, client);
@@ -598,6 +616,77 @@ async function hydrateRacerFromDb(roomId, room, userId, st) {
 // Requires 20260728_p25a_settle_room.sql to be APPLIED FIRST. Deployed ahead of
 // it, every call returns a PostgREST error and the room is NOT settled — so this
 // deploy is gated on the DDL, unlike the P2 mark whose failure was inert.
+// ── Phase 3 shadow scoring ───────────────────────────────────────────────────
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000, toRad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * toRad, dLng = (lng2 - lng1) * toRad;
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(Math.min(1, a)));
+}
+
+// Feed one message's raw fixes into the racer's shadow accumulator. Every
+// numeric guard here is load-bearing: fx is client-supplied and must never be
+// able to poison the accumulator or throw (the caller runs inside the M-3
+// message guard, but a NaN would corrupt silently, not loudly).
+function shadowIngest(st, fx) {
+  let sh = st.shadow;
+  if (!sh) sh = st.shadow = { last: null, rawM: 0, credM: 0, n: 0, firstTs: 0, lastTs: 0,
+                              drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false };
+  const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
+  for (const f of list) {
+    if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
+    if (!Array.isArray(f) || f.length < 4) { sh.drop.bad++; continue; }
+    const [t, la, ln, ac] = f;
+    if (!Number.isFinite(t) || !Number.isFinite(la) || !Number.isFinite(ln) ||
+        la < -90 || la > 90 || ln < -180 || ln > 180) { sh.drop.bad++; continue; }
+    sh.n++;
+    if (!sh.firstTs) sh.firstTs = t;
+    if (Number.isFinite(ac) && ac > SHADOW_MAX_ACC_M) { sh.drop.acc++; continue; }
+    if (sh.last) {
+      const dtS = (t - sh.last.t) / 1000;
+      if (dtS <= 0) { sh.drop.order++; continue; }          // out-of-order / duplicate
+      const chord = haversineM(sh.last.la, sh.last.ln, la, ln);
+      if (chord / dtS > SHADOW_TELEPORT_MPS) {
+        // Teleport: no credit, but RE-ANCHOR — otherwise one glitch fix poisons
+        // every subsequent chord against a stale anchor.
+        sh.drop.tele++;
+        sh.last = { t, la, ln };
+        continue;
+      }
+      sh.rawM += chord;
+      sh.credM += chord;     // v1: cred == raw minus the gates above; deadband
+                             // and stationarity are judged OFFLINE from the deltas
+    }
+    sh.last = { t, la, ln };
+    sh.lastTs = t;
+  }
+}
+
+// Persist every racer's shadow tally once. Multiple hooks may race (terminal
+// settle, ROOM CLOSED, GC) — the per-racer flag plus the table's PK upsert make
+// that harmless. Fire-and-forget: shadow must never delay teardown paths.
+function flushShadow(roomId, room, via) {
+  if (!SERVER_SHADOW_DISTANCE || !supabase || !room || !room.racers) return;
+  for (const [userId, st] of room.racers) {
+    const sh = st.shadow;
+    if (!sh || sh.flushed || sh.n === 0) continue;
+    sh.flushed = true;
+    const row = {
+      room_id: roomId, user_id: userId,
+      raw_m: Math.round(sh.rawM), cred_m: Math.round(sh.credM),
+      client_m: Math.round(st.lastDist || 0),
+      fixes: sh.n, drops: sh.drop,
+      meta: { firstTs: sh.firstTs, lastTs: sh.lastTs, over: sh.over, via },
+    };
+    log(`SHADOW room=${roomId} user=${userId} raw=${row.raw_m} cred=${row.cred_m} ` +
+        `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}`);
+    supabase.from('race_shadow_distance').upsert(row)
+      .then(({ error }) => { if (error) log('SHADOW upsert failed', roomId, userId, error.message); })
+      .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
+  }
+}
+
 async function settleRoom(roomId, status, reason) {
   if (!supabase) return null;                             // TEST_MODE: fully inert
   try {
@@ -1350,6 +1439,11 @@ wss.on('connection', async (ws, req) => {
           }
           st.lastDataTs = nowTs;
         }
+        // Phase 3 shadow: score the piggybacked raw fixes. Read-only w.r.t.
+        // everything below — the room continues to run on the client's number.
+        if (SERVER_SHADOW_DISTANCE && st && Array.isArray(payload.fx) && payload.fx.length) {
+          shadowIngest(st, payload.fx);
+        }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
         const distM = st ? budgetedDistance(room, st, payload.distance_m, nowTs)
                          : payload.distance_m;
@@ -1580,6 +1674,7 @@ wss.on('connection', async (ws, req) => {
         room.emptySince = Date.now();
         log(`ROOM EMPTY (kept for eviction timers) room=${roomId}`);
       } else {
+        flushShadow(roomId, room, 'room_closed');
         rooms.delete(roomId);
         log(`ROOM CLOSED room=${roomId}`);
       }
@@ -1735,6 +1830,7 @@ const inactivityTimer = setInterval(() => {
       if (room.clients.size === 0 && room.emptySince &&
           (room.terminal || now - room.emptySince > EMPTY_ROOM_TTL_MS)) {
         if (room.completeTimer) clearTimeout(room.completeTimer);
+        flushShadow(roomId, room, 'gc');
         rooms.delete(roomId);
         log(`ROOM GC room=${roomId}`);
         continue;
