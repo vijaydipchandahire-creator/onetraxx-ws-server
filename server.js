@@ -263,6 +263,16 @@ const PRESENCE_GAP_LOG_MS   = 30000;             // episode logging threshold = 
 // (accuracy / ordering / teleport): the client's stationary/deadband gates are
 // the ones under investigation, so the shadow must NOT replicate them.
 const SERVER_SHADOW_DISTANCE   = true;   // kill switch — restart to revert
+
+// ── LiveKit voice sweep (loitering audit 2026-08-17, fixed 2026-08-18) ──────
+// Every 5 min the relay invokes the livekit-sweep Edge Function with its own
+// service-role key; the function deletes LiveKit rooms whose race is cancelled
+// / finished >10 min / row-less, force-disconnecting loiterers. Lives here
+// (not in pg_cron) because a cron command would have to embed the service key
+// in the cron table — the exact exposure D-04 removed. Relay restarts cost at
+// most one 5-min cycle.
+const LIVEKIT_SWEEP_ENABLED     = true;  // kill switch — restart to revert
+const LIVEKIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const SHADOW_MAX_FX_PER_MSG    = 120;    // per-message cap (client sends ≤120)
 const SHADOW_MAX_FIXES         = 14400;  // per racer (~4h at 1/s) — memory bound
 const SHADOW_MAX_ACC_M         = 40;     // worse accuracy contributes nothing
@@ -1820,6 +1830,29 @@ function perRacerSweep(roomId, room, now) {
     }
   }
 }
+
+// LiveKit voice sweep — see the constant block for why this lives on the relay.
+// Fire-and-forget with a log line either way; a failed cycle just waits for the
+// next one. Skipped in TEST_MODE (no Supabase env).
+const livekitSweepTimer = (LIVEKIT_SWEEP_ENABLED && !TEST_MODE) ? setInterval(async () => {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/livekit-sweep`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(30000),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) log('LIVEKIT-SWEEP failed', res.status, body && body.error);
+    else if (body && body.closed && body.closed.length) log(`LIVEKIT-SWEEP closed=${body.closed.join(',')} live=${body.live}`);
+  } catch (e) {
+    log('LIVEKIT-SWEEP error', e && e.message);
+  }
+}, LIVEKIT_SWEEP_INTERVAL_MS) : null;
+if (livekitSweepTimer && livekitSweepTimer.unref) livekitSweepTimer.unref();
 
 const inactivityTimer = setInterval(() => {
   // M-3: contain a throw so one bad room can't kill the whole lifecycle sweep
