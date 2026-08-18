@@ -190,6 +190,18 @@ const BUDGET_FLOOR_M         = 25;
 // See supabase/sql/20260814_r64p3_crossing_measure.sql for why it is a phase.
 const SERVER_CROSSING_STAMP = true;              // kill switch — restart to revert
 
+// ── Crossing-resolve: the crossing IS the finish (2026-08-18) ────────────────
+// resolve_crossing_finish (service-role-only RPC) writes the RANKED race_results
+// row the instant this relay witnesses the accepted distance reach the target.
+// A locked/JS-suspended racer's claim then becomes a CONFIRMATION at unlock
+// instead of the thing the whole room waits on (rooms f803900c/b50bebc5,
+// 2026-08-18: "finishing…" held ~4.7 min until unlock, then the honest claims
+// were flagged stale_time_claim). source='baseline' crossings are excluded —
+// the real crossing happened where this relay could not see it.
+// Requires supabase/sql/20260818_crossing_resolve_finish.sql APPLIED FIRST;
+// deployed against the old DB every call fails closed to a logged RPC error.
+const SERVER_CROSSING_RESOLVE = process.env.SERVER_CROSSING_RESOLVE !== '0';  // kill switch
+
 // ── Per-racer eviction policy (2026-07-12, PROPOSAL_DNF_EVICTION_POLICY.md) ──
 // REQ1: a racer whose transport is absent for 10 CONTINUOUS minutes is evicted
 // (durable DNF via evict_racer_dnf). Any reconnect clears the clock, so
@@ -1006,6 +1018,40 @@ function recordCrossing(roomId, room, st, userId, accepted) {
     // outcome of a reconnect and not a problem worth a line.
     if (error && error.code !== '23505') log('CROSSING write failed', roomId, error.message);
   }, (e) => log('CROSSING write threw', roomId, e && e.message));
+
+  // Crossing-resolve: write the ranked finish NOW, server-side. Same contract as
+  // the stamp above — fire-and-forget, swallows its own errors, never costs a
+  // frame and never fails a race; a lost write degrades to the pre-fix behaviour
+  // (the racer's own claim resolves them at unlock).
+  if (SERVER_CROSSING_RESOLVE && source === 'live') {
+    supabase.rpc('resolve_crossing_finish', {
+      p_room_id: roomId, p_user_id: userId,
+      p_elapsed_ms: elapsed, p_distance_m: Math.round(accepted),
+    }).then(({ data: pos, error }) => {
+      if (error) { log('CROSSING-RESOLVE rpc failed', roomId, userId, error.message); return; }
+      // null = room not 'racing', target unmet, or a standing gate verdict
+      // (mock/T8/DNF row) this resolve must not overturn — the claim path owns it.
+      if (pos == null) return;
+      log(`CROSSING-RESOLVE room=${roomId} user=${userId} pos=${pos}`);
+      // Mirror the client's own 'finished' relay exactly: first-write-wins on the
+      // terminal flags (E-12), finishedAt stamps the FIRST witness only, the
+      // broadcast flips peer HUDs off "finishing…", and the completion check can
+      // now settle the room with no client awake to claim.
+      if (st && !st.finished && !st.quit && !st.evicted) {
+        st.finishedAt = Date.now();
+        st.finished = true;
+      }
+      room.hasFinisher = true;
+      broadcast(room, { event: 'finished', payload: {
+        user_id: userId, position: pos, distance_m: Math.round(accepted),
+      } });
+      scheduleCompletionCheck(roomId, room);
+      void (async () => {
+        await markLifecycle(roomId, userId, 'finished', 'crossing_resolve');
+        scheduleCompletionCheck(roomId, room);
+      })();
+    }, (e) => log('CROSSING-RESOLVE rpc threw', roomId, e && e.message));
+  }
 }
 
 // Debounced server-side completion check. Exists because finishers may leave
