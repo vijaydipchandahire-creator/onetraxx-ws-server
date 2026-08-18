@@ -725,7 +725,9 @@ function flushShadow(roomId, room, via) {
     };
     log(`SHADOW room=${roomId} user=${userId} raw=${row.raw_m} cred=${row.cred_m} ` +
         `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}`);
-    supabase.from('race_shadow_distance').upsert(row)
+    // ignoreDuplicates: first successful flush wins (terminal fires before
+    // room_closed/gc), so a late flush can never overwrite the canonical row.
+    supabase.from('race_shadow_distance').upsert(row, { onConflict: 'room_id,user_id', ignoreDuplicates: true })
       .then(({ error }) => { if (error) log('SHADOW upsert failed', roomId, userId, error.message); })
       .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
   }
@@ -1566,7 +1568,10 @@ wss.on('connection', async (ws, req) => {
         }
         // Phase 3 shadow: score the piggybacked raw fixes. Read-only w.r.t.
         // everything below — the room continues to run on the client's number.
-        if (SERVER_SHADOW_DISTANCE && st && Array.isArray(payload.fx) && payload.fx.length) {
+        // Post-terminal fixes carry no information about the race (R-90's
+        // sibling: a racer loitering after finishing inflated raw_m 600→5797
+        // and the gc flush overwrote the clean terminal row).
+        if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.fx) && payload.fx.length) {
           shadowIngest(st, payload.fx);
         }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
