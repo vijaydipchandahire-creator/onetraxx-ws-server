@@ -202,6 +202,18 @@ const SERVER_CROSSING_STAMP = true;              // kill switch — restart to r
 // deployed against the old DB every call fails closed to a logged RPC error.
 const SERVER_CROSSING_RESOLVE = process.env.SERVER_CROSSING_RESOLVE !== '0';  // kill switch
 
+// ── Canonical replay curve (2026-08-18) ──────────────────────────────────────
+// The race preview replayed each device's LOCAL frame buffer, so every racer
+// saw a different movie (per-device sampling, Doze holes, own-credited vs
+// server-budgeted distance). This relay is the only observer identical for all
+// racers: sample each racer's BUDGETED distance every REPLAY_STEP_MS and flush
+// one race_replay_curves row per racer at room terminal — the flushShadow
+// pattern exactly. Requires supabase/sql/20260818_replay_curves.sql APPLIED
+// FIRST; against the old DB every flush fails closed to a logged upsert error.
+const SERVER_REPLAY_CURVE  = process.env.SERVER_REPLAY_CURVE !== '0';  // kill switch
+const REPLAY_STEP_MS       = 5000;
+const REPLAY_MAX_SAMPLES   = 2880;   // 4h at 5s — per-racer memory bound
+
 // ── Per-racer eviction policy (2026-07-12, PROPOSAL_DNF_EVICTION_POLICY.md) ──
 // REQ1: a racer whose transport is absent for 10 CONTINUOUS minutes is evicted
 // (durable DNF via evict_racer_dnf). Any reconnect clears the clock, so
@@ -420,6 +432,7 @@ function deliverTerminal(room, roomId, payload, exceptWs) {
   room.terminal = { payload, mid: `${roomId}:${Date.now()}` };
   log(`TERMINAL room=${roomId} reason=${payload && payload.reason}`);
   flushShadow(roomId, room, 'terminal');
+  flushReplayCurves(roomId, room, 'terminal');
   for (const client of room.clients) {
     if (client === exceptWs) continue;
     sendTerminalWithRetry(room, client);
@@ -706,6 +719,47 @@ function flushShadow(roomId, room, via) {
     supabase.from('race_shadow_distance').upsert(row)
       .then(({ error }) => { if (error) log('SHADOW upsert failed', roomId, userId, error.message); })
       .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
+  }
+}
+
+// Canonical replay: one sample per REPLAY_STEP_MS of the racer's ACCEPTED
+// (budget-trimmed) distance, positionally indexed from started_at so every
+// racer's curve shares one timeline. Silent stretches (locked device, dropped
+// socket) backfill with the last value — monotonic by construction, and a
+// late-arriving burst can only raise a sample, never lower it. Same abstention
+// as recordCrossing: no started_at anchor, no samples.
+function recordReplaySample(room, st, accepted) {
+  if (!SERVER_REPLAY_CURVE) return;
+  const startedAt = room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : null;
+  if (!startedAt) return;
+  const idx = Math.floor((Date.now() - startedAt) / REPLAY_STEP_MS);
+  if (idx < 0 || idx >= REPLAY_MAX_SAMPLES) return;
+  if (!st.replayCurve) st.replayCurve = { arr: [], flushed: false };
+  const arr = st.replayCurve.arr;
+  const m = Math.max(0, Math.round(accepted));
+  const prev = arr.length ? arr[arr.length - 1] : 0;
+  while (arr.length <= idx) arr.push(prev);
+  if (m > arr[idx]) arr[idx] = m;
+}
+
+// Flush at room terminal — same contract and call sites as flushShadow:
+// fire-and-forget, idempotent via the flushed flag, a lost write costs only
+// this room's canonical replay (clients fall back to their local frames).
+function flushReplayCurves(roomId, room, via) {
+  if (!SERVER_REPLAY_CURVE || !supabase || !room || !room.racers) return;
+  const startedAt = room.meta && room.meta.startedAt;
+  if (!startedAt) return;
+  for (const [userId, st] of room.racers) {
+    const rc = st.replayCurve;
+    if (!rc || rc.flushed || rc.arr.length < 2) continue;
+    rc.flushed = true;
+    supabase.from('race_replay_curves').upsert({
+      room_id: roomId, user_id: userId,
+      t0: startedAt, step_ms: REPLAY_STEP_MS, dist_m: rc.arr,
+    }).then(({ error }) => {
+      if (error) log('REPLAY-FLUSH upsert failed', roomId, userId, error.message);
+      else log(`REPLAY-FLUSH room=${roomId} user=${userId} samples=${rc.arr.length} via=${via}`);
+    }, (e) => log('REPLAY-FLUSH error', roomId, userId, e && e.message));
   }
 }
 
@@ -1505,6 +1559,8 @@ wss.on('connection', async (ws, req) => {
                          : payload.distance_m;
         // R-64 Part 3 phase 1 — measurement only, changes nothing below it.
         if (st) recordCrossing(roomId, room, st, ws.userId, distM);
+        // Canonical replay sample — measurement only, same contract.
+        if (st) recordReplaySample(room, st, distM);
         room.gps.set(ws.userId, {
           user_id: ws.userId,
           distance_m: distM,
@@ -1731,6 +1787,7 @@ wss.on('connection', async (ws, req) => {
         log(`ROOM EMPTY (kept for eviction timers) room=${roomId}`);
       } else {
         flushShadow(roomId, room, 'room_closed');
+        flushReplayCurves(roomId, room, 'room_closed');
         rooms.delete(roomId);
         log(`ROOM CLOSED room=${roomId}`);
       }
@@ -1910,6 +1967,7 @@ const inactivityTimer = setInterval(() => {
           (room.terminal || now - room.emptySince > EMPTY_ROOM_TTL_MS)) {
         if (room.completeTimer) clearTimeout(room.completeTimer);
         flushShadow(roomId, room, 'gc');
+        flushReplayCurves(roomId, room, 'gc');
         rooms.delete(roomId);
         log(`ROOM GC room=${roomId}`);
         continue;
