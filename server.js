@@ -730,6 +730,10 @@ function flushShadow(roomId, room, via) {
 // as recordCrossing: no started_at anchor, no samples.
 function recordReplaySample(room, st, accepted) {
   if (!SERVER_REPLAY_CURVE) return;
+  // Post-terminal gps (a device loitering on results, or rejoining after the
+  // race ended) must not seed a fresh curve: a new racer state backfills from 0
+  // and the gc flush would clobber the canonical terminal curve with it.
+  if (room.terminal) return;
   const startedAt = room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : null;
   if (!startedAt) return;
   const idx = Math.floor((Date.now() - startedAt) / REPLAY_STEP_MS);
@@ -753,10 +757,12 @@ function flushReplayCurves(roomId, room, via) {
     const rc = st.replayCurve;
     if (!rc || rc.flushed || rc.arr.length < 2) continue;
     rc.flushed = true;
+    // ignoreDuplicates: first successful flush wins (terminal fires before
+    // room_closed/gc), so a late flush can never overwrite the canonical curve.
     supabase.from('race_replay_curves').upsert({
       room_id: roomId, user_id: userId,
       t0: startedAt, step_ms: REPLAY_STEP_MS, dist_m: rc.arr,
-    }).then(({ error }) => {
+    }, { onConflict: 'room_id,user_id', ignoreDuplicates: true }).then(({ error }) => {
       if (error) log('REPLAY-FLUSH upsert failed', roomId, userId, error.message);
       else log(`REPLAY-FLUSH room=${roomId} user=${userId} samples=${rc.arr.length} via=${via}`);
     }, (e) => log('REPLAY-FLUSH error', roomId, userId, e && e.message));
