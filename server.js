@@ -297,6 +297,15 @@ const SERVER_SHADOW_DISTANCE   = true;   // kill switch — restart to revert
 // most one 5-min cycle.
 const LIVEKIT_SWEEP_ENABLED     = true;  // kill switch — restart to revert
 const LIVEKIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+// Spectator sockets must not hold a terminal room open (they count toward
+// clients.size, so one backgrounded viewer kept full room state — racer maps,
+// shadow + replay buffers — in memory indefinitely and delayed the room_closed
+// flushes). After the race ends: a spectator that ACKED the terminal is closed
+// once the finish pills have had their moment; one that never acks (dead or
+// wedged socket) is closed on the hard deadline regardless. Racer sockets are
+// never touched here — results/terminal redelivery still needs them.
+const SPECTATOR_TERMINAL_LINGER_MS      = 60 * 1000;       // acked spectators
+const SPECTATOR_TERMINAL_HARD_CLOSE_MS  = 5 * 60 * 1000;   // unacked fallback
 const SHADOW_MAX_FX_PER_MSG    = 120;    // per-message cap (client sends ≤120)
 const SHADOW_MAX_FIXES         = 14400;  // per racer (~4h at 1/s) — memory bound
 const SHADOW_MAX_ACC_M         = 40;     // worse accuracy contributes nothing
@@ -429,7 +438,7 @@ function broadcast(room, message, exceptWs) {
 // races the finisher's teardown. Pin the terminal payload on the room so a
 // socket that (re)joins later still gets it, and re-send per client until acked.
 function deliverTerminal(room, roomId, payload, exceptWs) {
-  room.terminal = { payload, mid: `${roomId}:${Date.now()}` };
+  room.terminal = { payload, mid: `${roomId}:${Date.now()}`, at: Date.now() };
   log(`TERMINAL room=${roomId} reason=${payload && payload.reason}`);
   flushShadow(roomId, room, 'terminal');
   flushReplayCurves(roomId, room, 'terminal');
@@ -1977,6 +1986,22 @@ const inactivityTimer = setInterval(() => {
         rooms.delete(roomId);
         log(`ROOM GC room=${roomId}`);
         continue;
+      }
+      // Spectator eviction on terminal rooms (see the constant block). Acked
+      // spectators close after the linger; unacked ones on the hard deadline.
+      // close() feeds the normal LEAVE path, so the last socket leaving still
+      // triggers ROOM CLOSED + its flushes exactly as a voluntary exit would.
+      if (room.terminal && room.terminal.at && room.clients.size > 0) {
+        const age = now - room.terminal.at;
+        if (age > SPECTATOR_TERMINAL_LINGER_MS) {
+          for (const client of room.clients) {
+            if (client.role !== 'spectator' || client.readyState !== WebSocket.OPEN) continue;
+            const acked = client.ackedTerminalMid === room.terminal.mid;
+            if (!acked && age <= SPECTATOR_TERMINAL_HARD_CLOSE_MS) continue;
+            try { client.close(4000, 'race over'); } catch (e) {}
+            log(`SPECTATOR-CLOSE room=${roomId} user=${client.userId} acked=${acked} age_ms=${age}`);
+          }
+        }
       }
       if (!room.raceActive || room.terminal) continue;
       roomLevelSweep(roomId, room, now);
