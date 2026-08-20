@@ -311,6 +311,40 @@ const SHADOW_MAX_FIXES         = 14400;  // per racer (~4h at 1/s) — memory bo
 const SHADOW_MAX_ACC_M         = 40;     // worse accuracy contributes nothing
 const SHADOW_TELEPORT_MPS      = 15;     // >54 km/h chord speed = re-anchor, no credit
 
+// ── Phase B (v2) — cred_m becomes GATED (2026-08-20). STILL SHADOW-ONLY. ────
+// v1 measured cred==raw and proved raw path length is not rankable (LG +185%,
+// racer2 +13..30% over client on 18–20 Aug races). v2 makes cred_m the number
+// Phase C would flip to: smoothed-track crediting instead of raw chords.
+// Full rationale + exit criteria: SHADOW_PHASE_B_DESIGN.md. Pipeline:
+//   v1 sanity gates → CV Kalman (port of src/lib/gpsKalman.js, Phase-1 params,
+//   adaptation OFF — it measured worse on-device) → positional stationarity
+//   (anchor-ball dwell, NEVER reported Doppler speed — R-69's slow-walker
+//   lesson) → anchor-quantum crediting with a noise floor → 12 m/s cap.
+// raw_m keeps its v1 meaning so the delta series continues uninterrupted.
+const SERVER_SHADOW_V2       = true;   // kill switch — false reverts cred_m to the v1 raw mirror
+const SHADOW_K_PROCESS_ACC   = 0.1;    // = client GPS_KALMAN_PROCESS_ACC
+const SHADOW_K_ACC_SCALE     = 1.0;    // = client GPS_KALMAN_ACC_SCALE
+const SHADOW_K_MAX_GAP_MS    = 30000;  // dt clamp for the predict step (numerical safety)
+const SHADOW_K_INIT_VEL_VAR  = 4.0;    // (2 m/s)^2
+const SHADOW_K_ZUPT_VEL_VAR  = 0.09;   // (0.3 m/s)^2 — "stopped, fairly sure", see client note
+const SHADOW_FLOOR_M         = 3.5;    // = client GPS_NOISE_FLOOR_M (credit quantum floor)
+const SHADOW_FLOOR_ACC_K     = 0.5;    // = client GPS_NOISE_ACCURACY_K
+// Stationary = the smoothed track's NET displacement over a SLIDING
+// SHADOW_STILL_WINDOW_MS window is under SHADOW_STILL_NET_M. Sliding, not
+// anchor-dwell: a parked phone's error drifts slowly (~2–3 m / 15 s), which
+// keeps escaping a fixed anchor ball and never accrues the dwell, while the
+// sliding question "how far in the last 15 s" answers still immediately.
+// 5 m: a 2 km/h walker covers 8.3 m / 15 s — 1.7x margin even with filter
+// lag (the R-69 protected case). Positional by design: Doppler is telemetry
+// only, never a gate.
+const SHADOW_STILL_WINDOW_MS = 15000;
+const SHADOW_STILL_NET_M     = 5;
+const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS; cycling out of scope
+// A delivery gap longer than this re-seeds the filter and anchors: v2 never
+// credits across a suspension gap (raw_m still measures the gap chord, as v1 did).
+const SHADOW_RESET_GAP_MS    = 30000;
+const SHADOW_NIS_SAMPLE_MAX  = 3000;   // bounded like the client's census sampling
+
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
@@ -669,6 +703,160 @@ function haversineM(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(Math.min(1, a)));
 }
 
+// ── v2: constant-velocity Kalman, per racer, INLINE because deploy.sh ships
+// exactly one file. Faithful port of src/lib/gpsKalman.js (two decoupled 1-D
+// filters in a local metre frame; the client header carries the full math
+// rationale) minus the pieces v2 does not use: the adaptive process noise
+// (shipped OFF on the client — it detects motion, not turns) and the
+// moving/still path split (v2 does its own split downstream).
+function createShadowKalman() {
+  let lat0 = null, lng0 = null, mPerDegLng = 0, lastTs = 0, started = false;
+  const ax = { p: 0, v: 0, P00: 0, P01: 0, P11: 0 };
+  const ay = { p: 0, v: 0, P00: 0, P01: 0, P11: 0 };
+  const predict = (a, dt) => {
+    const s2 = SHADOW_K_PROCESS_ACC * SHADOW_K_PROCESS_ACC;
+    const dt2 = dt * dt, dt3 = dt2 * dt, dt4 = dt2 * dt2;
+    a.p += a.v * dt;
+    const P00 = a.P00 + 2 * dt * a.P01 + dt2 * a.P11 + s2 * dt4 / 4;
+    const P01 = a.P01 + dt * a.P11 + s2 * dt3 / 2;
+    const P11 = a.P11 + s2 * dt2;
+    a.P00 = P00; a.P01 = P01; a.P11 = P11;
+  };
+  const update = (a, z, R) => {
+    const S = a.P00 + R;
+    const innov = z - a.p;
+    const k0 = a.P00 / S, k1 = a.P01 / S;
+    const P00 = a.P00, P01 = a.P01;
+    a.p += k0 * innov;
+    a.v += k1 * innov;
+    a.P00 = P00 - k0 * P00;
+    a.P01 = P01 - k0 * P01;
+    a.P11 = a.P11 - k1 * P01;
+    return (innov * innov) / S;
+  };
+  return {
+    // Fix ts, never wall clock: a replayed batch shares one arrival instant
+    // while spanning minutes (the client's §2c trap).
+    step(la, ln, ac, t) {
+      const R0 = Math.max(1, (Number.isFinite(ac) ? ac : 10) * SHADOW_K_ACC_SCALE);
+      if (!started) {
+        lat0 = la; lng0 = ln;
+        mPerDegLng = 111320 * Math.cos(la * Math.PI / 180);
+        ax.p = 0; ax.v = 0; ax.P00 = R0 * R0; ax.P01 = 0; ax.P11 = SHADOW_K_INIT_VEL_VAR;
+        ay.p = 0; ay.v = 0; ay.P00 = R0 * R0; ay.P01 = 0; ay.P11 = SHADOW_K_INIT_VEL_VAR;
+        lastTs = t; started = true;
+        return { x: 0, y: 0, nis: null };
+      }
+      const zx = (ln - lng0) * mPerDegLng;
+      const zy = (la - lat0) * 110540;
+      const dt = Math.min(Math.max(0, t - lastTs), SHADOW_K_MAX_GAP_MS) / 1000;
+      lastTs = t;
+      predict(ax, dt); predict(ay, dt);
+      const R = R0 * R0;
+      const nis = update(ax, zx, R) + update(ay, zy, R);
+      return { x: ax.p, y: ay.p, nis };
+    },
+    // Zero-velocity update: applied AFTER step so the position correction
+    // lands — asserting "not moving", not "not here".
+    zupt() {
+      ax.v = 0; ay.v = 0;
+      ax.P11 = SHADOW_K_ZUPT_VEL_VAR; ax.P01 = 0;
+      ay.P11 = SHADOW_K_ZUPT_VEL_VAR; ay.P01 = 0;
+    },
+  };
+}
+
+// Re-seed the v2 pipeline (teleport or delivery gap). The old filter state
+// describes a track that is glitched or minutes stale; carrying it forward
+// would mint smoothed length no real movement produced.
+function shadowV2Reset(sh) {
+  sh.k = null; sh.sx = null; sh.sy = null;
+  sh.win = []; sh.credAnchor = null;
+  sh.pendM = 0; sh.still = false; sh.v2LastTs = 0;
+}
+
+// One accepted fix through the v2 pipeline: smooth → stationarity → credit.
+function shadowV2Step(sh, t, la, ln, ac, spd) {
+  // Doppler is TELEMETRY ONLY, never a gate — R-69: the LG's Doppler reads ~0
+  // at slow walk, and speed-gating it starved 2 km/h walkers on the client.
+  if (Number.isFinite(spd)) { if (spd < 0.8) sh.spd.lo++; else sh.spd.hi++; }
+  else sh.spd.na++;
+  if (sh.v2LastTs && t - sh.v2LastTs > SHADOW_RESET_GAP_MS) shadowV2Reset(sh);
+  if (!sh.k) sh.k = createShadowKalman();
+  const r = sh.k.step(la, ln, ac, t);
+  const prevTs = sh.v2LastTs;
+  sh.v2LastTs = t;
+  if (r.nis !== null && sh.nis.length < SHADOW_NIS_SAMPLE_MAX) sh.nis.push(r.nis);
+  if (sh.sx === null) {
+    sh.sx = r.x; sh.sy = r.y;
+    sh.win = [{ t, x: r.x, y: r.y }];
+    sh.credAnchor = { x: r.x, y: r.y, t };
+    return;
+  }
+  const step = Math.hypot(r.x - sh.sx, r.y - sh.sy);
+  sh.sx = r.x; sh.sy = r.y;
+  sh.smoothRawM += step;
+
+  // Stationarity: net displacement of the smoothed track over the sliding
+  // window (see the constants' note for why sliding beats an anchor dwell).
+  // Prune keeps the newest sample OLDER than the window edge as the boundary
+  // reference; until one exists (first 15 s after a reset) the verdict
+  // abstains to "moving" — abstention must never suppress credit.
+  sh.win.push({ t, x: r.x, y: r.y });
+  while (sh.win.length >= 2 && sh.win[1].t <= t - SHADOW_STILL_WINDOW_MS) sh.win.shift();
+  // Hysteresis: LEAVING still needs 1.25x the entry ball. A parked phone's
+  // slow error drift hovers right at the entry threshold and would otherwise
+  // flap out and credit escape hops. 1.25x, not more: a 2 km/h walker nets
+  // 8.3 m / 15 s and must clear the escape bar promptly (6.25 m) — synthetics
+  // showed 1.5x (7.5 m) re-creating the R-69 under-credit at -11%.
+  const entry = Math.max(SHADOW_STILL_NET_M,
+                         SHADOW_FLOOR_ACC_K * (Number.isFinite(ac) ? ac : 10));
+  const ball = sh.still ? entry * 1.25 : entry;
+  const ref = sh.win[0];
+  const wasStill = sh.still;
+  sh.still = (ref.t <= t - SHADOW_STILL_WINDOW_MS) &&
+             Math.hypot(r.x - ref.x, r.y - ref.y) < ball;
+  if (sh.still && !wasStill) {
+    // Pre-stop residue never escaped the credit floor by construction.
+    sh.floorM += sh.pendM;
+    sh.pendM = 0;
+  } else if (!sh.still && wasStill) {
+    // Restart after a stop: credit resumes from HERE. Movement inside the
+    // stop window is deliberately forfeited — conservative, and it keeps a
+    // drifting parked phone at zero.
+    sh.credAnchor = { x: r.x, y: r.y, t };
+    sh.pendM = 0;
+  }
+
+  if (sh.still) {
+    sh.zuptN++;
+    sh.k.zupt();
+    sh.stillM += step;
+    if (prevTs) sh.stillMs += Math.max(0, t - prevTs);
+    return;
+  }
+
+  // Anchor-quantum crediting: what is credited is the NET anchor-to-anchor
+  // hop — a polyline through points spaced ≥ the floor — not the smoothed
+  // path between them. The smoothed path still integrates residual wiggle
+  // (synthetics put that at +15..+70% on noisy tracks); a net hop's noise
+  // bias is ~sigma^2/hop, a few percent, and at ~4 m hops the straight-line
+  // corner cut is negligible. pendM (path since anchor) stays as the wiggle
+  // telemetry: floorM accrues (path - hop), the shave the polyline took.
+  sh.pendM += step;
+  const floor = Math.max(SHADOW_FLOOR_M,
+                         SHADOW_FLOOR_ACC_K * (Number.isFinite(ac) ? ac : 10));
+  const fromCred = Math.hypot(r.x - sh.credAnchor.x, r.y - sh.credAnchor.y);
+  if (fromCred >= floor) {
+    const dtS = Math.max(0.001, (t - sh.credAnchor.t) / 1000);
+    if (fromCred / dtS > SHADOW_MAX_CREDIT_MPS) sh.capM += fromCred;
+    else sh.credM += fromCred;
+    sh.floorM += Math.max(0, sh.pendM - fromCred);
+    sh.pendM = 0;
+    sh.credAnchor = { x: r.x, y: r.y, t };
+  }
+}
+
 // Feed one message's raw fixes into the racer's shadow accumulator. Every
 // numeric guard here is load-bearing: fx is client-supplied and must never be
 // able to poison the accumulator or throw (the caller runs inside the M-3
@@ -676,12 +864,18 @@ function haversineM(lat1, lng1, lat2, lng2) {
 function shadowIngest(st, fx) {
   let sh = st.shadow;
   if (!sh) sh = st.shadow = { last: null, rawM: 0, credM: 0, n: 0, firstTs: 0, lastTs: 0,
-                              drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false };
+                              drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false,
+                              // v2 pipeline state (inert when SERVER_SHADOW_V2 is false)
+                              k: null, sx: null, sy: null, v2LastTs: 0,
+                              smoothRawM: 0, stillM: 0, floorM: 0, capM: 0,
+                              win: [], still: false, stillMs: 0, zuptN: 0,
+                              credAnchor: null, pendM: 0,
+                              nis: [], spd: { lo: 0, hi: 0, na: 0 } };
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
     if (!Array.isArray(f) || f.length < 4) { sh.drop.bad++; continue; }
-    const [t, la, ln, ac] = f;
+    const [t, la, ln, ac, spd] = f;
     if (!Number.isFinite(t) || !Number.isFinite(la) || !Number.isFinite(ln) ||
         la < -90 || la > 90 || ln < -180 || ln > 180) { sh.drop.bad++; continue; }
     sh.n++;
@@ -693,15 +887,19 @@ function shadowIngest(st, fx) {
       const chord = haversineM(sh.last.la, sh.last.ln, la, ln);
       if (chord / dtS > SHADOW_TELEPORT_MPS) {
         // Teleport: no credit, but RE-ANCHOR — otherwise one glitch fix poisons
-        // every subsequent chord against a stale anchor.
+        // every subsequent chord against a stale anchor. v2 re-seeds too: the
+        // filter would otherwise smoothly interpolate the glitch into length.
         sh.drop.tele++;
         sh.last = { t, la, ln };
+        if (SERVER_SHADOW_V2) shadowV2Reset(sh);
         continue;
       }
-      sh.rawM += chord;
-      sh.credM += chord;     // v1: cred == raw minus the gates above; deadband
-                             // and stationarity are judged OFFLINE from the deltas
+      sh.rawM += chord;                              // v1 semantics, unchanged
+      if (!SERVER_SHADOW_V2) sh.credM += chord;      // v1 mirror when v2 is off
     }
+    // v2 sees exactly the fixes raw_m chords are built from (first accepted
+    // fix included), so cred-vs-raw deltas are attributable to the gates alone.
+    if (SERVER_SHADOW_V2) shadowV2Step(sh, t, la, ln, ac, spd);
     sh.last = { t, la, ln };
     sh.lastTs = t;
   }
@@ -716,15 +914,39 @@ function flushShadow(roomId, room, via) {
     const sh = st.shadow;
     if (!sh || sh.flushed || sh.n === 0) continue;
     sh.flushed = true;
+    const meta = { firstTs: sh.firstTs, lastTs: sh.lastTs, over: sh.over, via };
+    if (SERVER_SHADOW_V2) {
+      // NIS percentiles (client census semantics): filter-health readout —
+      // p50 far above 2.0 means stated accuracy under-states the true error.
+      const sorted = sh.nis.slice().sort((a, b) => a - b);
+      const pct = (p) => sorted.length
+        ? Math.round(sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)))] * 10) / 10
+        : null;
+      Object.assign(meta, {
+        v: 2,
+        smoothRawM: Math.round(sh.smoothRawM),  // smoothed track pre-gating (the pure-Kalman number)
+        stillM: Math.round(sh.stillM),          // suppressed while stationary
+        floorM: Math.round(sh.floorM),          // sub-floor residue, never released
+        capM: Math.round(sh.capM),              // dropped by the 12 m/s cap
+        stillSec: Math.round(sh.stillMs / 1000),
+        zupt: sh.zuptN,
+        nisP50: pct(0.5), nisP90: pct(0.9),
+        nisMax: sorted.length ? Math.round(sorted[sorted.length - 1] * 10) / 10 : null,
+        spd: sh.spd,                            // Doppler lo/hi/na buckets — telemetry only
+      });
+    }
     const row = {
       room_id: roomId, user_id: userId,
       raw_m: Math.round(sh.rawM), cred_m: Math.round(sh.credM),
       client_m: Math.round(st.lastDist || 0),
       fixes: sh.n, drops: sh.drop,
-      meta: { firstTs: sh.firstTs, lastTs: sh.lastTs, over: sh.over, via },
+      meta,
     };
     log(`SHADOW room=${roomId} user=${userId} raw=${row.raw_m} cred=${row.cred_m} ` +
-        `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}`);
+        `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}` +
+        (SERVER_SHADOW_V2
+          ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec}`
+          : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
     supabase.from('race_shadow_distance').upsert(row, { onConflict: 'room_id,user_id', ignoreDuplicates: true })
