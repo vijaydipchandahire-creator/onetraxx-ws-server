@@ -343,6 +343,15 @@ const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS; cycling ou
 // A delivery gap longer than this re-seeds the filter and anchors: v2 never
 // credits across a suspension gap (raw_m still measures the gap chord, as v1 did).
 const SHADOW_RESET_GAP_MS    = 30000;
+// ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
+// C0 = dry-run: the ladder is computed and logged on every frame but the room
+// still runs on the budgeted client claim. C1 = flip SERVER_AUTHORITATIVE_DISTANCE
+// to true (one constant, one reload to revert). The budget path keeps running
+// underneath in both modes — it is rung 2 of the ladder and must stay warm.
+const SERVER_AUTH_DRYRUN          = true;   // C0: compute + log AUTH-DELTA
+const SERVER_AUTHORITATIVE_DISTANCE = false; // C1 flip — DO NOT set true before C0 exit criteria pass
+const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to rung 2
+
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
 // harness false-greened the LG K61 (R-101). Capture is pre-drop: teleports and
@@ -875,7 +884,12 @@ function shadowIngest(st, fx) {
                               smoothRawM: 0, stillM: 0, floorM: 0, capM: 0,
                               win: [], still: false, stillMs: 0, zuptN: 0,
                               credAnchor: null, pendM: 0,
-                              nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [] };
+                              nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
+                              seedM: 0, lastFxWallTs: 0 };
+  // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
+  // rejoin) already holds credit — fold it in once at creation, exactly as
+  // budgetedDistance seeds from baselineDist. Zero on a normal race start.
+  if (sh.n === 0) sh.seedM = Math.max(st.authDist || 0, st.baselineDist || 0);
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
@@ -914,7 +928,36 @@ function shadowIngest(st, fx) {
     if (SERVER_SHADOW_V2) shadowV2Step(sh, t, la, ln, ac, spd);
     sh.last = { t, la, ln };
     sh.lastTs = t;
+    sh.lastFxWallTs = Date.now();   // arrival clock, not fix ts — staleness must
+                                    // survive a device clock that lies
   }
+}
+
+// ── Phase C ladder (see SHADOW_PHASE_C_DESIGN.md §2) ─────────────────────────
+// Rung 1: v2 credit while the fix stream is fresh. Rung 2: today's budgeted
+// claim (computed EVERY frame regardless — its st fields feed eviction and the
+// fallback must stay warm). Same monotone + target invariants as the budget.
+// C0 returns budgetM (dry-run); C1 returns authM. st.authDist tracks the ladder
+// in both modes so the flip changes which number the room reads, not the math.
+function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
+  const budgetM = budgetedDistance(room, st, claimed, nowTs);
+  const sh = st.shadow;
+  const fxFresh = !!(SERVER_SHADOW_V2 && sh && sh.n > 0 &&
+                     sh.lastFxWallTs && nowTs - sh.lastFxWallTs <= AUTH_FX_STALE_MS);
+  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM, sh.rawM)) : budgetM;
+  authM = Math.max(st.authDist || 0, authM);
+  const targetM = room.meta && room.meta.targetM;
+  if (targetM > 0) authM = Math.min(authM, targetM);
+  st.authDist = authM;
+  st.authN = (st.authN || 0) + 1;
+  if (fxFresh) st.authR1 = (st.authR1 || 0) + 1;
+  if (SERVER_AUTH_DRYRUN && (!st.authLogTs || nowTs - st.authLogTs >= 60000)) {
+    st.authLogTs = nowTs;
+    log(`AUTH-DELTA room=${roomId} user=${userId} rung=${fxFresh ? 1 : 2} ` +
+        `auth=${Math.round(authM)} budget=${Math.round(budgetM)} drift=${Math.round(authM - budgetM)} ` +
+        `r1=${st.authR1 || 0}/${st.authN}`);
+  }
+  return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
 
 // Persist every racer's shadow tally once. Multiple hooks may race (terminal
@@ -953,6 +996,12 @@ function flushShadow(roomId, room, via) {
       if (sh.credM > sh.rawM) {
         meta.overRawM = Math.round(sh.credM - sh.rawM);
         sh.credM = sh.rawM;
+      }
+      // Phase C0 per-race summary: final ladder value, rung-1 frame share, seed.
+      if (SERVER_AUTH_DRYRUN && st.authN) {
+        meta.auth = { m: Math.round(st.authDist || 0), n: st.authN,
+                      r1: st.authR1 || 0, seedM: Math.round(sh.seedM || 0),
+                      live: SERVER_AUTHORITATIVE_DISTANCE };
       }
     }
     const row = {
@@ -1824,7 +1873,7 @@ wss.on('connection', async (ws, req) => {
           shadowIngest(st, payload.fx);
         }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
-        const distM = st ? budgetedDistance(room, st, payload.distance_m, nowTs)
+        const distM = st ? authoritativeDistance(roomId, room, st, ws.userId, payload.distance_m, nowTs)
                          : payload.distance_m;
         // R-64 Part 3 phase 1 — measurement only, changes nothing below it.
         if (st) recordCrossing(roomId, room, st, ws.userId, distM);
