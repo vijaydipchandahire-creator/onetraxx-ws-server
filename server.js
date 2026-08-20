@@ -934,6 +934,14 @@ function flushShadow(roomId, room, via) {
         nisMax: sorted.length ? Math.round(sorted[sorted.length - 1] * 10) / 10 : null,
         spd: sh.spd,                            // Doppler lo/hi/na buckets — telemetry only
       });
+      // cred≤raw is a published invariant (register R-100 col 15). The CV
+      // filter can overshoot through speed changes and mint smoothed length
+      // beyond the raw path (LG 2f314303: smooth 611 / raw 598 / cred 605), so
+      // enforce it here and keep the excess visible for tuning.
+      if (sh.credM > sh.rawM) {
+        meta.overRawM = Math.round(sh.credM - sh.rawM);
+        sh.credM = sh.rawM;
+      }
     }
     const row = {
       room_id: roomId, user_id: userId,
