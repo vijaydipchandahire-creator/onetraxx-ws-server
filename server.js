@@ -343,6 +343,11 @@ const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS; cycling ou
 // A delivery gap longer than this re-seeds the filter and anchors: v2 never
 // credits across a suspension gap (raw_m still measures the gap chord, as v1 did).
 const SHADOW_RESET_GAP_MS    = 30000;
+// Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
+// constants can be tuned offline against REAL device traces — the synthetic
+// harness false-greened the LG K61 (R-101). Capture is pre-drop: teleports and
+// acc-rejects are exactly what tuning needs to see. Kill switch, no client path.
+const SHADOW_PERSIST_FIXES   = true;
 const SHADOW_NIS_SAMPLE_MAX  = 3000;   // bounded like the client's census sampling
 
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
@@ -870,7 +875,7 @@ function shadowIngest(st, fx) {
                               smoothRawM: 0, stillM: 0, floorM: 0, capM: 0,
                               win: [], still: false, stillMs: 0, zuptN: 0,
                               credAnchor: null, pendM: 0,
-                              nis: [], spd: { lo: 0, hi: 0, na: 0 } };
+                              nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [] };
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
@@ -880,6 +885,13 @@ function shadowIngest(st, fx) {
         la < -90 || la > 90 || ln < -180 || ln > 180) { sh.drop.bad++; continue; }
     sh.n++;
     if (!sh.firstTs) sh.firstTs = t;
+    // Rounding keeps a 14400-fix worst case ~600 KB of jsonb; 6 decimals is
+    // ~0.1 m, below anything the gates can resolve.
+    if (SHADOW_PERSIST_FIXES) {
+      sh.fx.push([t, +la.toFixed(6), +ln.toFixed(6),
+                  Number.isFinite(ac) ? +ac.toFixed(1) : null,
+                  Number.isFinite(spd) ? +spd.toFixed(2) : null]);
+    }
     if (Number.isFinite(ac) && ac > SHADOW_MAX_ACC_M) { sh.drop.acc++; continue; }
     if (sh.last) {
       const dtS = (t - sh.last.t) / 1000;
@@ -960,6 +972,13 @@ function flushShadow(roomId, room, via) {
     supabase.from('race_shadow_distance').upsert(row, { onConflict: 'room_id,user_id', ignoreDuplicates: true })
       .then(({ error }) => { if (error) log('SHADOW upsert failed', roomId, userId, error.message); })
       .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
+    if (SHADOW_PERSIST_FIXES && sh.fx && sh.fx.length) {
+      supabase.from('race_shadow_fixes')
+        .upsert({ room_id: roomId, user_id: userId, fixes: sh.fx, n: sh.fx.length, meta: { via } },
+                { onConflict: 'room_id,user_id', ignoreDuplicates: true })
+        .then(({ error }) => { if (error) log('SHADOW-FIX upsert failed', roomId, userId, error.message); })
+        .catch((e) => log('SHADOW-FIX upsert error', roomId, userId, e && e.message));
+    }
   }
 }
 
