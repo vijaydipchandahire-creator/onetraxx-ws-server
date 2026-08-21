@@ -349,7 +349,7 @@ const SHADOW_RESET_GAP_MS    = 30000;
 // to true (one constant, one reload to revert). The budget path keeps running
 // underneath in both modes — it is rung 2 of the ladder and must stay warm.
 const SERVER_AUTH_DRYRUN          = true;   // C0: compute + log AUTH-DELTA
-const SERVER_AUTHORITATIVE_DISTANCE = false; // C1 flip — DO NOT set true before C0 exit criteria pass
+const SERVER_AUTHORITATIVE_DISTANCE = true;  // C1 LIVE 2026-08-22 — C0 exit criteria passed (6 organic races, rung-1 100%, drift in band); revert = false + reload
 const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to rung 2
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
