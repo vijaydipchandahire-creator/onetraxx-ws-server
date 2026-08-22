@@ -366,6 +366,24 @@ const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to r
 const FINISH_CLAIM_GUARD      = process.env.FINISH_CLAIM_GUARD !== '0';  // kill switch
 const FINISH_CLAIM_MIN_FRAC   = 0.5;   // auth credit below this share of target = divergent
 const FINISH_CLAIM_MIN_FRAMES = 30;    // ladder frames seen before the guard may speak
+// ── Display blend (client-side-prediction pattern, server-side placement) ────
+// 2026-08-22 race c200d981: the pocketed realme's auth credit lagged its own
+// honest budget by up to ~85 m while the stillness clamp flapped (stillSec=195),
+// so every HUD showed it trailing and catching up in bursts. The still-gate
+// sweep (scripts/replay-still-tune.mjs) proved the gate itself cannot be
+// loosened without breaking the parked / 2 km/h guards — so the fix is the
+// standard prediction+reconciliation split: the number the room DISPLAYS may
+// run a bounded distance ahead of the number the room SCORES. displayM =
+// max(auth, min(budget, auth + LEAD)) — budget is the racer's own budgeted
+// claim (rung 2, speed-capped), so an honest racer displays their true
+// distance while a forged claim shows at most LEAD m of phantom, with zero
+// scoring effect. Below target the display is additionally held FINISH_HOLD m
+// short so the C2 finish gate still lands exactly with the server CROSSING.
+// Blend applies ONLY at the gps fan-out; crossings, replay curves, eviction
+// progress, R-107 and results all read pure authM. Restart to revert.
+const SERVER_DISPLAY_BLEND = process.env.SERVER_DISPLAY_BLEND !== '0';   // kill switch
+const DISPLAY_LEAD_M       = 50;   // max metres display may lead verified credit
+const DISPLAY_FINISH_HOLD_M = 3;   // held short of target until the real crossing
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
@@ -964,6 +982,7 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
   st.authDist = authM;
+  st.budgetDist = budgetM;   // display blend reads this; never used for scoring
   st.authN = (st.authN || 0) + 1;
   if (fxFresh) st.authR1 = (st.authR1 || 0) + 1;
   if (SERVER_AUTH_DRYRUN && (!st.authLogTs || nowTs - st.authLogTs >= 60000)) {
@@ -973,6 +992,24 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         `r1=${st.authR1 || 0}/${st.authN}`);
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
+}
+
+// Display blend (see the SERVER_DISPLAY_BLEND constants): the distance the room
+// RENDERS, given the distance the room SCORES. Pure — extracted by the shadow
+// harness. Identity when the blend is off, when authoritative mode is off (distM
+// already IS the budget then), or when there is no budget to lead with.
+function displayDistance(room, st, authM) {
+  if (!SERVER_DISPLAY_BLEND || !SERVER_AUTHORITATIVE_DISTANCE) return authM;
+  const budgetM = st && st.budgetDist;
+  if (!(budgetM > authM)) return authM;                      // auth leads or equal: truth wins
+  let d = Math.max(authM, Math.min(budgetM, authM + DISPLAY_LEAD_M));
+  const targetM = room && room.meta && room.meta.targetM;
+  // Never show the line crossed before the server witnesses it: while auth is
+  // short of target the display parks just under it, and the moment the real
+  // CROSSING runs auth to target the clamp vanishes (authM >= targetM path
+  // never reaches here — budget cannot exceed an auth already at target-cap).
+  if (targetM > 0 && authM < targetM) d = Math.min(d, targetM - DISPLAY_FINISH_HOLD_M);
+  return d;
 }
 
 // R-107 predicate: does this racer's first witnessed self-finish diverge from
@@ -1937,9 +1974,11 @@ wss.on('connection', async (ws, req) => {
         if (st) recordCrossing(roomId, room, st, ws.userId, distM);
         // Canonical replay sample — measurement only, same contract.
         if (st) recordReplaySample(room, st, distM);
+        // The FAN-OUT (and only the fan-out) renders the display blend; every
+        // consumer above and below this line keeps scoring on distM (auth).
         room.gps.set(ws.userId, {
           user_id: ws.userId,
-          distance_m: distM,
+          distance_m: st ? displayDistance(room, st, distM) : distM,
           speed_kmh: payload.speed_kmh,
           ts: payload.ts || Date.now(),
         });
