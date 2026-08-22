@@ -1594,7 +1594,7 @@ async function maybeCompleteRace(roomId, room) {
   try {
     const [{ data: rawMembers, error: mErr }, { data: results, error: rErr }] = await Promise.all([
       supabase.from('room_members').select('user_id, lifecycle').eq('room_id', roomId).eq('role', 'racer'),
-      supabase.from('race_results').select('user_id, finish_position').eq('room_id', roomId),
+      supabase.from('race_results').select('user_id, finish_position, finish_time_ms, distance_covered_m').eq('room_id', roomId),
     ]);
     // P2: drop ONLY the terminal-with-row states. 'finished' deliberately STAYS in
     // the roster — dropping it would relax the rule that every roster racer needs a
@@ -1637,15 +1637,27 @@ async function maybeCompleteRace(roomId, room) {
     }
     const settled = new Set((results || []).map(r => r.user_id));
     const hasFinisher = (results || []).some(r => r.finish_position != null);
+    // R-116: an UNRANKED row whose racer completed the distance (finish_time_ms
+    // set + distance at target — a quit row never reaches target) is still a
+    // completer waiting on the stragglers. Register rooms 90d25427/edf04fe0 sat
+    // 'racing' for hours: every finisher was mock-flagged unranked, so
+    // hasFinisher never unlocked the gone window below and the room outlived
+    // relay memory. Client parity: checkRaceComplete's quitCount already counts
+    // these rows toward completion. targetM 0 (failed meta read) disables the
+    // term — fail-closed to today's behavior.
+    const metaTargetM = room.meta?.targetM || 0;
+    const hasCompleter = hasFinisher || (results || []).some(r =>
+      r.finish_position == null && r.finish_time_ms != null &&
+      metaTargetM > 0 && (r.distance_covered_m || 0) >= metaTargetM);
     const now = Date.now();
     const unresolved = members.filter(({ user_id }) => {
       if (settled.has(user_id)) return false;
-      // The 90s-gone shortcut only applies when a FINISHER is waiting on the
+      // The 90s-gone shortcut only applies when a COMPLETER is waiting on the
       // straggler (client-parity: only a present finisher/driver ever completed
       // on the gone window). Without one, nothing but a durable result row
-      // (quit/eviction) resolves a racer — a zero-finisher room can never be
+      // (quit/eviction) resolves a racer — a zero-completer room can never be
       // settled out from under a screen-locked racer who is still racing.
-      if (!hasFinisher) return true;
+      if (!hasCompleter) return true;
       const st = room.racers.get(user_id);
       // Rowless-finisher term (client parity, strictly weaker). Resolve a racer whose
       // 'finished' relay THIS server witnessed >= FINISH_NOROW_DWELL_MS ago and whose
@@ -1673,6 +1685,20 @@ async function maybeCompleteRace(roomId, room) {
       if (won === null) { log('SERVER-COMPLETE failed', roomId); return; }
       if (settleWon(won)) {
         log(`SERVER-COMPLETE room=${roomId}${allMarked ? ' all_marked' : ''}`);
+        deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
+      }
+    } else if (hasCompleter) {
+      // R-116: unranked completer(s) only. Request 'finished' and let
+      // settle_room decide — its C5 gate keeps the outcome honest (witnessed
+      // live crossing → 'finished', 6-min orphan-crossing deferral → the
+      // reconcile cron may still rank the row, otherwise downgrade to
+      // 'cancelled'). No new terminal semantics live here; a 'deferred' return
+      // fails settleWon and the room settles on a later check or the 15-min
+      // cron rule.
+      const won = await settleRoom(roomId, 'finished', 'all_done');
+      if (won === null) { log('SERVER-COMPLETE (unranked completer) failed', roomId); return; }
+      if (settleWon(won)) {
+        log(`SERVER-COMPLETE unranked_completer room=${roomId}${allMarked ? ' all_marked' : ''} settle=${won}`);
         deliverTerminal(room, roomId, { reason: 'all_done', server_finalized: true });
       }
     } else {
