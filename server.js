@@ -1972,13 +1972,16 @@ wss.on('connection', async (ws, req) => {
                          : payload.distance_m;
         // R-64 Part 3 phase 1 — measurement only, changes nothing below it.
         if (st) recordCrossing(roomId, room, st, ws.userId, distM);
-        // Canonical replay sample — measurement only, same contract.
-        if (st) recordReplaySample(room, st, distM);
-        // The FAN-OUT (and only the fan-out) renders the display blend; every
-        // consumer above and below this line keeps scoring on distM (auth).
+        // The two RENDER consumers — the live fan-out and the replay recorder —
+        // get the display blend; every scoring consumer keeps distM (auth).
+        // Replay deliberately matches what the screens showed (2026-08-22
+        // preview of c200d981: curves on pure auth replayed the realme's
+        // still-clamp lag that the live blend now hides).
+        const dispM = st ? displayDistance(room, st, distM) : distM;
+        if (st) recordReplaySample(room, st, dispM);
         room.gps.set(ws.userId, {
           user_id: ws.userId,
-          distance_m: st ? displayDistance(room, st, distM) : distM,
+          distance_m: dispM,
           speed_kmh: payload.speed_kmh,
           ts: payload.ts || Date.now(),
         });
