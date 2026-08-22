@@ -923,6 +923,15 @@ function shadowIngest(st, fx) {
   // rejoin) already holds credit — fold it in once at creation, exactly as
   // budgetedDistance seeds from baselineDist. Zero on a normal race start.
   if (sh.n === 0) sh.seedM = Math.max(st.authDist || 0, st.baselineDist || 0);
+  // Finish snapshot: devices stream fixes for minutes after finishing, so the
+  // flushed cred_m includes post-finish walking (22-Aug read: +43–60% "over-
+  // credit" that was really cooldown meters). Freeze the race-portion numbers
+  // the first time we ingest after st.finished flips; flushShadow publishes
+  // them as meta.fin*. One site, fail-soft, never touches crediting itself.
+  if (st.finished && !sh.finSnap) {
+    sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
+                   ts: sh.lastTs, wall: Date.now() };
+  }
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
@@ -1092,6 +1101,20 @@ function flushShadow(roomId, room, via) {
         meta.overRawM = Math.round(sh.credM - sh.rawM);
         sh.credM = sh.rawM;
       }
+      // Finish snapshot (see shadowIngest): credit at the moment the racer
+      // finished, before post-finish cooldown fixes kept accruing. Filled here
+      // when the racer finished but no gps message arrived afterwards (flush
+      // values ARE the finish values then). finM carries the cred≤raw clamp.
+      if (st.finished && !sh.finSnap) {
+        sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
+                       ts: sh.lastTs, wall: Date.now() };
+      }
+      if (sh.finSnap) {
+        meta.finM    = Math.round(Math.min(sh.finSnap.credM, sh.finSnap.rawM));
+        meta.finRawM = Math.round(sh.finSnap.rawM);
+        meta.finAuthM = Math.round(sh.finSnap.authM);
+        meta.finTs   = sh.finSnap.ts;
+      }
       // Phase C0 per-race summary: final ladder value, rung-1 frame share, seed.
       if (SERVER_AUTH_DRYRUN && st.authN) {
         meta.auth = { m: Math.round(st.authDist || 0), n: st.authN,
@@ -1109,7 +1132,7 @@ function flushShadow(roomId, room, via) {
     log(`SHADOW room=${roomId} user=${userId} raw=${row.raw_m} cred=${row.cred_m} ` +
         `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}` +
         (SERVER_SHADOW_V2
-          ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec}`
+          ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}`
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
