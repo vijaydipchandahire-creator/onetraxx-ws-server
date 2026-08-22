@@ -366,6 +366,17 @@ const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to r
 const FINISH_CLAIM_GUARD      = process.env.FINISH_CLAIM_GUARD !== '0';  // kill switch
 const FINISH_CLAIM_MIN_FRAC   = 0.5;   // auth credit below this share of target = divergent
 const FINISH_CLAIM_MIN_FRAMES = 30;    // ladder frames seen before the guard may speak
+// R-107 hardening (2026-08-22): a divergent finish is DEMOTED (unranked +
+// flagged, podium surrendered via demote_unwitnessed_finish) instead of only
+// flagged. The RPC refuses when a witnessed live crossing exists for the racer
+// — 22-Aug backtest: every honest crossing-less ranked finish had auth >= 95%
+// of target, far above the 50% trip wire, so no historical honest finish would
+// have demoted. Second trip wire: >= MIN_FRAMES gps frames observed but ZERO
+// embedded fixes ever ingested ('no_server_fixes') — an unmodified client
+// always piggybacks fx on the gps message, so frames-without-fixes is positive
+// forgery evidence rung 2 otherwise waves through. Kill switch reverts to the
+// flag-only behavior; the DB function stays inert then.
+const FINISH_CLAIM_DEMOTE     = process.env.FINISH_CLAIM_DEMOTE !== '0';
 // ── Display blend (client-side-prediction pattern, server-side placement) ────
 // 2026-08-22 race c200d981: the pocketed realme's auth credit lagged its own
 // honest budget by up to ~85 m while the stillness clamp flapped (stillSec=195),
@@ -1040,28 +1051,55 @@ function finishClaimDivergent(room, st) {
 // path (FINISH_NOROW_DWELL_MS). First-write-wins with the anti-cheat flags: a
 // row some gate already flagged keeps its original reason. Fire-and-forget,
 // never throws, DB-only — safe against a torn-down room.
-function flagDivergentFinish(roomId, userId, authM, targetM, attempt = 0) {
+function flagDivergentFinish(roomId, userId, authM, targetM, reason = 'server_credit_low', attempt = 0) {
   if (!supabase) return;
   const RETRY_MS = [15000, 45000, 120000];
-  supabase.from('race_results')
-    .update({ flagged: true, flag_reason: 'server_credit_low' })
+  // R-107 hardening: try the DEMOTE first — service-role RPC that unranks the
+  // row, surrenders podium credit and reranks survivors, but REFUSES when a
+  // witnessed live crossing exists for this racer ('witnessed'). 'no_ranked_row'
+  // means the claim has not landed (or landed unranked) yet — fall through to
+  // the flag update, whose retry ladder outlives the client's worst-case save
+  // path exactly as before. Any RPC failure fail-softs to flag-only, so the
+  // pre-hardening behavior is the floor, never less.
+  const flagOnly = () => supabase.from('race_results')
+    .update({ flagged: true, flag_reason: reason })
     .eq('room_id', roomId).eq('user_id', userId)
     .or('flagged.is.null,flagged.eq.false')
     .select('id')
     .then(({ data, error }) => {
       if (error) { log('FINISH-DIVERGENT flag write failed', roomId, userId, error.message); return; }
       if (data && data.length) {
-        log(`FINISH-DIVERGENT-FLAGGED room=${roomId} user=${userId} auth=${Math.round(authM)} target=${Math.round(targetM)} attempt=${attempt}`);
+        log(`FINISH-DIVERGENT-FLAGGED room=${roomId} user=${userId} auth=${Math.round(authM)} target=${Math.round(targetM)} reason=${reason} attempt=${attempt}`);
         return;
       }
       // No row matched: either not written yet (retry) or already flagged (a
       // retry is then a harmless no-op that exhausts quietly).
       if (attempt < RETRY_MS.length) {
-        setTimeout(() => flagDivergentFinish(roomId, userId, authM, targetM, attempt + 1), RETRY_MS[attempt]);
+        setTimeout(() => flagDivergentFinish(roomId, userId, authM, targetM, reason, attempt + 1), RETRY_MS[attempt]);
       } else {
         log(`FINISH-DIVERGENT-UNFLAGGED room=${roomId} user=${userId} (no unflagged row after ${attempt} retries)`);
       }
     }, (e) => log('FINISH-DIVERGENT flag write threw', roomId, userId, e && e.message));
+  if (!FINISH_CLAIM_DEMOTE) { flagOnly(); return; }
+  supabase.rpc('demote_unwitnessed_finish', { p_room_id: roomId, p_user_id: userId, p_reason: reason })
+    .then(({ data: verdict, error }) => {
+      if (error) {
+        log('FINISH-DIVERGENT demote rpc failed — falling back to flag', roomId, userId, error.message);
+        flagOnly();
+        return;
+      }
+      if (verdict === 'demoted') {
+        log(`FINISH-DIVERGENT-DEMOTED room=${roomId} user=${userId} auth=${Math.round(authM)} target=${Math.round(targetM)} reason=${reason} attempt=${attempt}`);
+        return;
+      }
+      if (verdict === 'witnessed') {
+        log(`FINISH-DIVERGENT-WITNESSED room=${roomId} user=${userId} (crossing exists — not demoted)`);
+        return;
+      }
+      // 'no_ranked_row' (or anything unexpected): flag the unranked row / retry
+      // until the claim lands, same contract as before.
+      flagOnly();
+    }, (e) => { log('FINISH-DIVERGENT demote rpc threw', roomId, userId, e && e.message); flagOnly(); });
 }
 
 // Persist every racer's shadow tally once. Multiple hooks may race (terminal
@@ -2166,13 +2204,26 @@ wss.on('connection', async (ws, req) => {
               // server never witnessed. Detect on the first witnessed finish only;
               // abstain without meta, without enough ladder frames, or when a
               // CROSSING already ran authDist up to target (the honest path).
-              if (!st.claimDivergent && finishClaimDivergent(room, st)) {
+              // no_server_fixes (R-107 hardening): the ladder observed enough
+              // gps frames to speak, yet the shadow accumulator never ingested
+              // a single fix. Rung 2 tracks the budgeted claim, so auth stays
+              // healthy and finishClaimDivergent cannot see this — but an
+              // unmodified client always piggybacks fx on the gps message, so
+              // frames-without-fixes is positive evidence on its own. Kept at
+              // the call site (not in the pure predicate) so the harness
+              // contract of finishClaimDivergent is unchanged.
+              const noFixes = FINISH_CLAIM_GUARD && SERVER_AUTHORITATIVE_DISTANCE &&
+                room.meta && room.meta.targetM > 0 &&
+                (st.authN || 0) >= FINISH_CLAIM_MIN_FRAMES &&
+                (!st.shadow || (st.shadow.n || 0) === 0);
+              if (!st.claimDivergent && (finishClaimDivergent(room, st) || noFixes)) {
                 st.claimDivergent = true;
                 const tgtM = room.meta.targetM;
+                const reason = finishClaimDivergent(room, st) ? 'server_credit_low' : 'no_server_fixes';
                 log(`FINISH-DIVERGENT room=${roomId} user=${ws.userId} ` +
                     `auth=${Math.round(st.authDist || 0)} target=${Math.round(tgtM)} ` +
-                    `frames=${st.authN} r1=${st.authR1 || 0}`);
-                flagDivergentFinish(roomId, ws.userId, st.authDist || 0, tgtM);
+                    `frames=${st.authN} r1=${st.authR1 || 0} reason=${reason}`);
+                flagDivergentFinish(roomId, ws.userId, st.authDist || 0, tgtM, reason);
               }
             } else st.quit = true;
           }
