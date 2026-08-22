@@ -351,6 +351,21 @@ const SHADOW_RESET_GAP_MS    = 30000;
 const SERVER_AUTH_DRYRUN          = true;   // C0: compute + log AUTH-DELTA
 const SERVER_AUTHORITATIVE_DISTANCE = true;  // C1 LIVE 2026-08-22 — C0 exit criteria passed (6 organic races, rung-1 100%, drift in band); revert = false + reload
 const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to rung 2
+// ── R-107 finish-claim guard ─────────────────────────────────────────────────
+// 2026-08-22 race ae772fe4: a racer whose fix stream was degraded all race
+// (rung 1 fresh, but every step below the stillness clamp) held auth=0 while
+// the client's own accumulator reached target — the client then self-finished
+// and its direct race_results write took pos=1 with ZERO server credit and no
+// CROSSING. Until Phase B deletes the client ranked write, the relay cannot
+// block that row; it CAN see the divergence at claim time and stamp the row
+// flagged. Fires only on POSITIVE evidence: authoritative mode on, target
+// known, the ladder observed for >= MIN_FRAMES frames, and auth credit under
+// MIN_FRAC of target. A real server crossing sets authDist = target before
+// any honest claim, and rung 2 tracks the budgeted claim itself, so neither
+// can trip this — only a starved-but-fresh rung-1 racer can.
+const FINISH_CLAIM_GUARD      = process.env.FINISH_CLAIM_GUARD !== '0';  // kill switch
+const FINISH_CLAIM_MIN_FRAC   = 0.5;   // auth credit below this share of target = divergent
+const FINISH_CLAIM_MIN_FRAMES = 30;    // ladder frames seen before the guard may speak
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
@@ -958,6 +973,49 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         `r1=${st.authR1 || 0}/${st.authN}`);
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
+}
+
+// R-107 predicate: does this racer's first witnessed self-finish diverge from
+// the authoritative ladder? Pure — extracted so the shadow harness can drive it.
+// Abstains (false) without meta, without enough observed ladder frames, or when
+// the guard/mode flags are off. A server CROSSING runs authDist to target before
+// any honest claim, and rung 2 IS the budgeted claim, so neither path can trip it.
+function finishClaimDivergent(room, st) {
+  if (!FINISH_CLAIM_GUARD || !SERVER_AUTHORITATIVE_DISTANCE) return false;
+  const targetM = room && room.meta && room.meta.targetM;
+  if (!(targetM > 0)) return false;
+  if ((st.authN || 0) < FINISH_CLAIM_MIN_FRAMES) return false;
+  return (st.authDist || 0) < targetM * FINISH_CLAIM_MIN_FRAC;
+}
+
+// R-107: stamp a divergent self-finished result row flagged. The client writes
+// its ranked row on its own schedule, so the row may not exist when the finish
+// relay arrives — retry on a ladder that outlives the client's worst-case save
+// path (FINISH_NOROW_DWELL_MS). First-write-wins with the anti-cheat flags: a
+// row some gate already flagged keeps its original reason. Fire-and-forget,
+// never throws, DB-only — safe against a torn-down room.
+function flagDivergentFinish(roomId, userId, authM, targetM, attempt = 0) {
+  if (!supabase) return;
+  const RETRY_MS = [15000, 45000, 120000];
+  supabase.from('race_results')
+    .update({ flagged: true, flag_reason: 'server_credit_low' })
+    .eq('room_id', roomId).eq('user_id', userId)
+    .or('flagged.is.null,flagged.eq.false')
+    .select('id')
+    .then(({ data, error }) => {
+      if (error) { log('FINISH-DIVERGENT flag write failed', roomId, userId, error.message); return; }
+      if (data && data.length) {
+        log(`FINISH-DIVERGENT-FLAGGED room=${roomId} user=${userId} auth=${Math.round(authM)} target=${Math.round(targetM)} attempt=${attempt}`);
+        return;
+      }
+      // No row matched: either not written yet (retry) or already flagged (a
+      // retry is then a harmless no-op that exhausts quietly).
+      if (attempt < RETRY_MS.length) {
+        setTimeout(() => flagDivergentFinish(roomId, userId, authM, targetM, attempt + 1), RETRY_MS[attempt]);
+      } else {
+        log(`FINISH-DIVERGENT-UNFLAGGED room=${roomId} user=${userId} (no unflagged row after ${attempt} retries)`);
+      }
+    }, (e) => log('FINISH-DIVERGENT flag write threw', roomId, userId, e && e.message));
 }
 
 // Persist every racer's shadow tally once. Multiple hooks may race (terminal
@@ -2011,6 +2069,20 @@ wss.on('connection', async (ws, req) => {
               // retry, and raceSendReliable itself retries).
               if (!st.finished) st.finishedAt = Date.now();
               st.finished = true;
+              // R-107: a self-finish claim while the authoritative ladder holds a
+              // fraction of the target is a divergent result — the client's own
+              // ranked write is about to (or already did) land a position the
+              // server never witnessed. Detect on the first witnessed finish only;
+              // abstain without meta, without enough ladder frames, or when a
+              // CROSSING already ran authDist up to target (the honest path).
+              if (!st.claimDivergent && finishClaimDivergent(room, st)) {
+                st.claimDivergent = true;
+                const tgtM = room.meta.targetM;
+                log(`FINISH-DIVERGENT room=${roomId} user=${ws.userId} ` +
+                    `auth=${Math.round(st.authDist || 0)} target=${Math.round(tgtM)} ` +
+                    `frames=${st.authN} r1=${st.authR1 || 0}`);
+                flagDivergentFinish(roomId, ws.userId, st.authDist || 0, tgtM);
+              }
             } else st.quit = true;
           }
           if (event === 'finished') room.hasFinisher = true;
