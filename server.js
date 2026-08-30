@@ -392,6 +392,30 @@ const STEP_PIN_STILL_S     = 20;    // still-flagged seconds before the pinned o
 const STEP_SHARE_MAX       = 0.60;  // step metres ≤ this share of the score...
 const STEP_SHARE_UNCAL     = 0.30;  // ...and only this much before λ is calibrated
 const STEP_CLEAN_FOR_CAL   = 3;     // clean segments before the full share releases
+// ── R-144 continuous step blend (DRY-RUN by default) ─────────────────────────
+// The two live-fusion pocket races (rooms f045010f/de389482) showed the rung's
+// residual: GPS that is degraded-but-not-broken pays ~85-90% of true pace every
+// segment — no starved/pinned alarm fires, yet the device drifts 10-20% behind
+// co-located phones mid-race (kiran −20% race 1, tina −15% race 2 at winner
+// cross; kiran's λ dragged to 0.58 vs Daily's 0.76 = the bias, measured). Fix:
+// steps stop being an emergency backup and become a continuous second witness.
+// Every non-degraded segment blends GPS credit with λ·ΔS at a weight that rises
+// with GPS unhealthiness (stillness share, fix sparsity, reported accuracy):
+// healthy ≈ STEP_BLEND_W_BASE (GPS dominant), degraded → up to W_MAX. The
+// blend is SYMMETRIC — it pulls a bleeding device up AND trims an inflating
+// one down (the morning 737-on-600 race) — with trims released only under a
+// confident λ and capped at STEP_TRIM_SHARE of the score. blendUp shares the
+// step rung's cap; the netM lower bound inside stepEst keeps vehicles/cycling
+// untrimmed (no steps, but real displacement). Accumulates + flushes always
+// (meta.fuse.up/dn); SERVER_STEP_BLEND=1 is the separate flip that SCORES it.
+const SERVER_STEP_BLEND    = process.env.SERVER_STEP_BLEND === '1';
+const STEP_BLEND_W_BASE    = 0.40;  // steps' weight in a fully healthy segment
+                                    // (harmless there — est≈gps — but it is what
+                                    // lets the blend act on degradation that
+                                    // LOOKS healthy, the observed failure shape)
+const STEP_BLEND_W_MAX     = 0.90;  // ...and in a fully degraded one
+const STEP_TRIM_SHARE      = 0.25;  // blend-down ≤ this share of the base score
+const STEP_LAMBDA_WINSOR   = 0.15;  // per-sample λ pull bound once lamN ≥ 5
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
 // still runs on the budgeted client claim. C1 = flip SERVER_AUTHORITATIVE_DISTANCE
@@ -1005,6 +1029,8 @@ function shadowIngest(st, fx) {
                               sxLast: null, sxSnap: null, sxLog: [], sxDrop: 0,
                               lambda: STEP_LAMBDA_PRIOR, lamN: 0,
                               stepM: 0, stepN: 0, stepSec: 0, pinM: 0,
+                              // R-144 blend accumulators + per-fix accuracy sums
+                              accSum: 0, accN: 0, blendUpM: 0, blendDnM: 0, blendN: 0,
                               nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
                               seedM: 0, lastFxWallTs: 0 };
   // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
@@ -1037,6 +1063,9 @@ function shadowIngest(st, fx) {
                   Number.isFinite(spd) ? +spd.toFixed(2) : null]);
     }
     if (Number.isFinite(ac) && ac > SHADOW_MAX_ACC_M) { sh.drop.acc++; continue; }
+    // R-144: per-accepted-fix accuracy sum — segment diffs give the blend its
+    // "how healthy was GPS in this window" input.
+    if (Number.isFinite(ac)) { sh.accSum += ac; sh.accN++; }
     if (sh.last) {
       const dtS = (t - sh.last.t) / 1000;
       if (dtS <= 0) { sh.drop.order++; continue; }          // out-of-order / duplicate
@@ -1108,6 +1137,7 @@ function shadowIngestSx(st, sx) {
 // GPS-accumulator snapshot at a segment boundary — the next boundary diffs it.
 function shadowSxSnap(sh) {
   return { credM: sh.credM, starvM: sh.starvM, stillMs: sh.stillMs, n: sh.n,
+           accSum: sh.accSum, accN: sh.accN,
            la: sh.last ? sh.last.la : null, ln: sh.last ? sh.last.ln : null };
 }
 
@@ -1128,45 +1158,100 @@ function shadowSxSegment(sh, dS, T, snap) {
 
   // λ calibration — ONLY from clean segments (good fix cadence, not still,
   // enough steps for a real sample, ratio inside the physiological band).
-  // Never from step-carried segments: no bootstrap loop, ever.
-  if (fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_CLEAN_MIN_STEPS && credDelta > 0) {
-    const ratio = credDelta / dS;
+  // Never from step-carried segments: no bootstrap loop, ever. Winsorized once
+  // established: a degraded epoch that still passes the clean gates (the race-1
+  // kiran shape, λ dragged 0.72 → 0.58) may pull λ at most ±15% per sample.
+  const accSpan = sh.accN - snap.accN;
+  const accMean = accSpan > 0 ? (sh.accSum - snap.accSum) / accSpan : 10;
+  // accMean ≤ 12 is part of CLEAN deliberately: a noisy-but-flowing segment
+  // must never teach λ its own inflation (the blend's trim depends on λ staying
+  // anchored to genuinely-good windows).
+  const clean = fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_CLEAN_MIN_STEPS &&
+                credDelta > 0 && accMean <= 12;
+  if (clean) {
+    let ratio = credDelta / dS;
     if (ratio >= STEP_LAMBDA_MIN && ratio <= STEP_LAMBDA_MAX) {
+      if (sh.lamN >= 5) {
+        ratio = Math.min(sh.lambda * (1 + STEP_LAMBDA_WINSOR),
+                Math.max(sh.lambda * (1 - STEP_LAMBDA_WINSOR), ratio));
+      }
       sh.lambda = sh.lamN === 0 ? ratio
                 : sh.lambda + STEP_LAMBDA_ALPHA * (ratio - sh.lambda);
       sh.lamN++;
     }
-    return;   // clean GPS scored this segment already — steps add nothing here
   }
 
-  // Degraded-window rung. Release gate: zero step credit until this racer has
-  // produced at least one clean GPS segment this race — a treadmill or a
-  // shaken phone never calibrates and never earns a metre.
-  if (sh.lamN < 1 || dS < STEP_MOVE_MIN_STEPS) return;
+  // Release gate: zero step influence until this racer has produced at least
+  // one clean GPS segment this race — a treadmill or a shaken phone never
+  // calibrates and never earns (or trims) a metre.
+  if (sh.lamN < 1) return;
+  const lam = Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lambda));
+  // clamp(λ·ΔS, netM, 12·T): the step-implied distance for this segment. The
+  // netM floor keeps vehicles/cycling honest (no steps, real displacement).
+  const est = Math.min(Math.max(lam * dS, netM), T * SHADOW_MAX_CREDIT_MPS);
+  const gps = credDelta + starvDelta;
+
+  // Degraded rung (starved delivery / pinned position): steps carry the
+  // segment outright — the R-143 behavior, unchanged.
   const starved = fixHz < STEP_STARVED_MAX_FIXHZ;
   const pinned  = stillS >= STEP_PIN_STILL_S;
-  if (!starved && !pinned) return;
-  const lam = Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lambda));
-  // clamp(λ·ΔS, netM, 12·T), minus whatever GPS already credited inside the
-  // segment (cred + banked gap chords) so the rungs never stack.
-  const est = Math.min(Math.max(lam * dS, netM), T * SHADOW_MAX_CREDIT_MPS);
-  const add = Math.max(0, est - credDelta - starvDelta);
-  if (add <= 0) return;
-  sh.stepM += add;
-  sh.stepN++;
-  sh.stepSec += Math.round(T);
-  if (pinned && !starved) sh.pinM += add;
+  if (starved || pinned) {
+    if (dS < STEP_MOVE_MIN_STEPS) return;
+    const add = Math.max(0, est - gps);
+    if (add <= 0) return;
+    sh.stepM += add;
+    sh.stepN++;
+    sh.stepSec += Math.round(T);
+    if (pinned && !starved) sh.pinM += add;
+    return;
+  }
+
+  // R-144 continuous blend — every remaining segment where the racer is
+  // demonstrably STEPPING. A cyclist / vehicle segment (few steps, real
+  // displacement) is deliberately out of scope: GPS-only, exactly as today.
+  // est keeps the chord floor (it carries the real displacement of a
+  // pin-recovery jump the credit gates forfeit) but DISCOUNTED by the
+  // segment's accuracy — endpoint error stretches the chord, and an
+  // undiscounted floor biased the blend upward on noisy-but-honest tracks.
+  if (dS < STEP_MOVE_MIN_STEPS) return;
+  const netFloor = Math.max(0, netM - 2 * accMean);
+  const estB = Math.min(Math.max(lam * dS, netFloor), T * SHADOW_MAX_CREDIT_MPS);
+  let w = STEP_BLEND_W_BASE
+        + 0.5 * Math.min(1, (stillS / T) * 2)
+        + 0.5 * Math.max(0, 1 - fixHz / 0.5)
+        + 0.3 * Math.max(0, (accMean - 10) / 20);
+  w = Math.min(STEP_BLEND_W_MAX, w);
+  const adj = w * (estB - gps);
+  if (adj > 0.5) {
+    sh.blendUpM += adj; sh.blendN++;
+  } else if (adj < -0.5 && sh.lamN >= STEP_CLEAN_FOR_CAL) {
+    // Trims only under a confident λ — an uncalibrated stride must never
+    // subtract metres GPS actually measured.
+    sh.blendDnM += -adj; sh.blendN++;
+  }
 }
 
 // Step metres eligible to SCORE: the share cap bounds the blast radius of a
 // wholly forged sx stream — step credit can carry at most STEP_SHARE_MAX of
 // the final score (STEP_SHARE_UNCAL before λ has STEP_CLEAN_FOR_CAL clean
 // segments). base·s/(1-s) is the algebra of "stepM ≤ s·(base+stepM)".
+// May return a NEGATIVE number once the blend scores: blend-down trims are
+// their own capped term. Each contribution is gated by its own env flag, so
+// this is 0 exactly when both rungs are dry.
 function stepScoreM(sh) {
-  if (!sh || !sh.stepM) return 0;
+  if (!sh) return 0;
   const base = sh.seedM + Math.min(sh.credM + sh.starvM, sh.rawM);
   const share = sh.lamN >= STEP_CLEAN_FOR_CAL ? STEP_SHARE_MAX : STEP_SHARE_UNCAL;
-  return Math.min(sh.stepM, base * share / (1 - share));
+  let add = 0;
+  if (SERVER_STEP_FUSION) {
+    // blendUp shares the step rung's cap — one pool of "metres steps added".
+    const pos = sh.stepM + (SERVER_STEP_BLEND ? sh.blendUpM : 0);
+    if (pos > 0) add += Math.min(pos, base * share / (1 - share));
+  }
+  if (SERVER_STEP_BLEND && sh.blendDnM > 0) {
+    add -= Math.min(sh.blendDnM, base * STEP_TRIM_SHARE);
+  }
+  return add;
 }
 
 // ── Phase C ladder (see SHADOW_PHASE_C_DESIGN.md §2) ─────────────────────────
@@ -1189,8 +1274,8 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   // when this rung exists. Its own bounds (per-segment clamp, cadence, release
   // gate, share cap inside stepScoreM) carry the invariant instead. Dry-run
   // (the default) leaves scoring EXACTLY as before; stepM is telemetry.
-  const stepM = (SERVER_STEP_FUSION && sh) ? stepScoreM(sh) : 0;
-  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : budgetM;
+  const stepM = sh ? stepScoreM(sh) : 0;   // flag-gated inside; may be negative (blend trim)
+  let authM = fxFresh ? Math.max(0, sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : budgetM;
   authM = Math.max(st.authDist || 0, authM);
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
@@ -1204,7 +1289,8 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         `auth=${Math.round(authM)} budget=${Math.round(budgetM)} drift=${Math.round(authM - budgetM)} ` +
         `r1=${st.authR1 || 0}/${st.authN}` +
         (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : '') +
-        (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : ''));
+        (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : '') +
+        (sh && (sh.blendUpM || sh.blendDnM) ? ` blend=+${Math.round(sh.blendUpM)}/-${Math.round(sh.blendDnM)}${SERVER_STEP_BLEND ? '(live)' : '(dry)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
@@ -1340,10 +1426,16 @@ function flushShadow(roomId, room, via) {
       // and whether it SCORED. The dry-run go/no-go reads: on a pocket race the
       // degraded device's cred + starv + fuse.m ≈ the healthy device's credit;
       // on healthy/parked/shake races fuse.m ≈ 0 (absent = no segments banked).
-      if (sh.stepN || sh.lamN || sh.sxDrop) {
+      if (sh.stepN || sh.lamN || sh.sxDrop || sh.blendN) {
         meta.fuse = { m: Math.round(sh.stepM), n: sh.stepN, sec: sh.stepSec,
                       pinM: Math.round(sh.pinM), lam: Math.round(sh.lambda * 100) / 100,
-                      lamN: sh.lamN, drop: sh.sxDrop, live: SERVER_STEP_FUSION };
+                      lamN: sh.lamN, drop: sh.sxDrop, live: SERVER_STEP_FUSION,
+                      // R-144 blend: metres the continuous blend would add/trim
+                      // and whether it SCORED. Dry-run read: up-dn should close
+                      // the laggard's winner-cross deficit; both ≈0 on a device
+                      // whose GPS matched its steps all race.
+                      up: Math.round(sh.blendUpM), dn: Math.round(sh.blendDnM),
+                      bn: sh.blendN, blive: SERVER_STEP_BLEND };
       }
       if (sh.finSnap && sh.finSnap.stepM) meta.finStepM = Math.round(sh.finSnap.stepM);
       // cred≤raw is a published invariant (register R-100 col 15). The CV
@@ -1387,7 +1479,8 @@ function flushShadow(roomId, room, via) {
         (SERVER_SHADOW_V2
           ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}` +
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
-            (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` : '')
+            (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
+                         ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
