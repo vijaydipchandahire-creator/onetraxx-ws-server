@@ -343,6 +343,22 @@ const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS; cycling ou
 // A delivery gap longer than this re-seeds the filter and anchors: v2 never
 // credits across a suspension gap (raw_m still measures the gap chord, as v1 did).
 const SHADOW_RESET_GAP_MS    = 30000;
+// ── Starvation credit rung (the R-118 residual; DRY-RUN by default) ──────────
+// A battery-managed phone delivers fixes in sparse bursts — sometimes 5-14 for
+// a whole race — and the reset above forfeits every inter-burst chord, so a
+// starved-but-moving racer credits ~0 (locked iPhone, room "Testing 9": 33 m
+// credited over 13.5 min while the carrier walked ~600). This rung recovers the
+// FORFEITED GAP CHORD only: the NET displacement between a >RESET_GAP gap's
+// endpoint fixes, capped at gap_time x SHADOW_MAX_CREDIT_MPS and credited only
+// when it clears both endpoints' noise floors. A stationary starved phone nets
+// ~0 by construction (its sparse fixes share one spot); net displacement can
+// never exceed what a live stream would have credited; the rawM clamp in the
+// ladder still binds on top. Teleport resets zero v2LastTs, so a glitch fix
+// can never be a gap endpoint. starvM is ALWAYS accumulated + logged + flushed
+// (meta.starv) — SERVER_STARVATION_LADDER=1 is the separate flip that lets it
+// SCORE (rung 1 becomes seedM + min(credM + starvM, rawM)). Default 0 = dry
+// run: read the would-be credit off telemetry before any result depends on it.
+const SERVER_STARVATION_LADDER = process.env.SERVER_STARVATION_LADDER === '1';
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
 // still runs on the budgeted client claim. C1 = flip SERVER_AUTHORITATIVE_DISTANCE
@@ -839,7 +855,30 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
   // at slow walk, and speed-gating it starved 2 km/h walkers on the client.
   if (Number.isFinite(spd)) { if (spd < 0.8) sh.spd.lo++; else sh.spd.hi++; }
   else sh.spd.na++;
-  if (sh.v2LastTs && t - sh.v2LastTs > SHADOW_RESET_GAP_MS) shadowV2Reset(sh);
+  if (sh.v2LastTs && t - sh.v2LastTs > SHADOW_RESET_GAP_MS) {
+    // Starvation gap-chord (see SERVER_STARVATION_LADDER): before the reset
+    // forfeits this gap, bank its bounded net chord. sh.last is still the
+    // PREVIOUS accepted fix here (the caller assigns it after this returns),
+    // and it is the same fix v2LastTs describes: acc-drops advance neither,
+    // and a teleport zeroes v2LastTs so this branch cannot run off one.
+    if (sh.last && Number.isFinite(sh.last.la)) {
+      const gapS = (t - sh.v2LastTs) / 1000;
+      const chord = haversineM(sh.last.la, sh.last.ln, la, ln);
+      const accPrev = Number.isFinite(sh.last.ac) ? sh.last.ac : 10;
+      const accCur  = Number.isFinite(ac) ? ac : 10;
+      // Both endpoints' noise floors: a parked starved phone whose two burst
+      // positions wander a few metres apart must net to zero credit.
+      const noise = Math.max(SHADOW_FLOOR_M, SHADOW_FLOOR_ACC_K * accPrev)
+                  + Math.max(SHADOW_FLOOR_M, SHADOW_FLOOR_ACC_K * accCur);
+      const credit = Math.min(chord, gapS * SHADOW_MAX_CREDIT_MPS);
+      if (credit > noise) {
+        sh.starvM += credit;
+        sh.starvN++;
+        sh.starvSec += Math.round(gapS);
+      }
+    }
+    shadowV2Reset(sh);
+  }
   if (!sh.k) sh.k = createShadowKalman();
   const r = sh.k.step(la, ln, ac, t);
   const prevTs = sh.v2LastTs;
@@ -928,6 +967,7 @@ function shadowIngest(st, fx) {
                               smoothRawM: 0, stillM: 0, floorM: 0, capM: 0,
                               win: [], still: false, stillMs: 0, zuptN: 0,
                               credAnchor: null, pendM: 0,
+                              starvM: 0, starvN: 0, starvSec: 0,
                               nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
                               seedM: 0, lastFxWallTs: 0 };
   // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
@@ -941,7 +981,7 @@ function shadowIngest(st, fx) {
   // them as meta.fin*. One site, fail-soft, never touches crediting itself.
   if (st.finished && !sh.finSnap) {
     sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
-                   ts: sh.lastTs, wall: Date.now() };
+                   starvM: sh.starvM, ts: sh.lastTs, wall: Date.now() };
   }
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
@@ -969,7 +1009,7 @@ function shadowIngest(st, fx) {
         // every subsequent chord against a stale anchor. v2 re-seeds too: the
         // filter would otherwise smoothly interpolate the glitch into length.
         sh.drop.tele++;
-        sh.last = { t, la, ln };
+        sh.last = { t, la, ln, ac: Number.isFinite(ac) ? ac : null };
         if (SERVER_SHADOW_V2) shadowV2Reset(sh);
         continue;
       }
@@ -979,7 +1019,7 @@ function shadowIngest(st, fx) {
     // v2 sees exactly the fixes raw_m chords are built from (first accepted
     // fix included), so cred-vs-raw deltas are attributable to the gates alone.
     if (SERVER_SHADOW_V2) shadowV2Step(sh, t, la, ln, ac, spd);
-    sh.last = { t, la, ln };
+    sh.last = { t, la, ln, ac: Number.isFinite(ac) ? ac : null };
     sh.lastTs = t;
     sh.lastFxWallTs = Date.now();   // arrival clock, not fix ts — staleness must
                                     // survive a device clock that lies
@@ -997,7 +1037,11 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   const sh = st.shadow;
   const fxFresh = !!(SERVER_SHADOW_V2 && sh && sh.n > 0 &&
                      sh.lastFxWallTs && nowTs - sh.lastFxWallTs <= AUTH_FX_STALE_MS);
-  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM, sh.rawM)) : budgetM;
+  // Starvation rung: when the ladder is live, forfeited gap chords score too —
+  // still inside the rawM clamp, so credit can never exceed the raw path.
+  // Dry-run (the default) leaves scoring EXACTLY as before; starvM is telemetry.
+  const starvM = (SERVER_STARVATION_LADDER && sh) ? sh.starvM : 0;
+  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM + starvM, sh.rawM)) : budgetM;
   authM = Math.max(st.authDist || 0, authM);
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
@@ -1009,7 +1053,8 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
     st.authLogTs = nowTs;
     log(`AUTH-DELTA room=${roomId} user=${userId} rung=${fxFresh ? 1 : 2} ` +
         `auth=${Math.round(authM)} budget=${Math.round(budgetM)} drift=${Math.round(authM - budgetM)} ` +
-        `r1=${st.authR1 || 0}/${st.authN}`);
+        `r1=${st.authR1 || 0}/${st.authN}` +
+        (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
@@ -1131,6 +1176,15 @@ function flushShadow(roomId, room, via) {
         nisMax: sorted.length ? Math.round(sorted[sorted.length - 1] * 10) / 10 : null,
         spd: sh.spd,                            // Doppler lo/hi/na buckets — telemetry only
       });
+      // Starvation rung readout: metres the gap-chord rung banked, how many
+      // gaps, seconds of race those gaps covered, and whether it SCORED.
+      // The dry-run go/no-go reads: cred_m + starv.m vs walked truth on a
+      // battery-saver race, and starv.m ≈ 0 on every healthy/parked race.
+      if (sh.starvN) {
+        meta.starv = { m: Math.round(sh.starvM), n: sh.starvN,
+                       sec: sh.starvSec, live: SERVER_STARVATION_LADDER };
+      }
+      if (sh.finSnap && sh.finSnap.starvM) meta.finStarvM = Math.round(sh.finSnap.starvM);
       // cred≤raw is a published invariant (register R-100 col 15). The CV
       // filter can overshoot through speed changes and mint smoothed length
       // beyond the raw path (LG 2f314303: smooth 611 / raw 598 / cred 605), so
@@ -1145,7 +1199,7 @@ function flushShadow(roomId, room, via) {
       // values ARE the finish values then). finM carries the cred≤raw clamp.
       if (st.finished && !sh.finSnap) {
         sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
-                       ts: sh.lastTs, wall: Date.now() };
+                       starvM: sh.starvM, ts: sh.lastTs, wall: Date.now() };
       }
       if (sh.finSnap) {
         meta.finM    = Math.round(Math.min(sh.finSnap.credM, sh.finSnap.rawM));
@@ -1170,7 +1224,8 @@ function flushShadow(roomId, room, via) {
     log(`SHADOW room=${roomId} user=${userId} raw=${row.raw_m} cred=${row.cred_m} ` +
         `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}` +
         (SERVER_SHADOW_V2
-          ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}`
+          ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}` +
+            (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
