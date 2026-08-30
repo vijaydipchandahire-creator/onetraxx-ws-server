@@ -411,6 +411,16 @@ const STEP_STARVED_MAX_FIXHZ = 0.125; // under 1 fix per 8 s = starved delivery
 const STEP_MOVE_MIN_STEPS  = 20;    // "steps say moving" per segment (~40 spm floor)
 const STEP_CADENCE_MAX_SPS = 3.3;   // beyond this = shaking, segment rejected
 const STEP_PIN_STILL_S     = 20;    // still-flagged seconds before the pinned override
+// R-155: under the episode trigger the bar drops to the still-gate's OWN
+// resolution. SHADOW_STILL_WINDOW_MS is 15 s, so stillness cannot even be
+// DECLARED before 15 s have passed — a 20 s bar sat above the detector that
+// feeds it, and nothing justified the extra 5 s. Measured across the three
+// 2026-08-30 pocket races (spread at winner-cross): 20 s → 109/27/56 m,
+// 15 s → 62/27/54 m, 12 s → 62/33/56 m, 8 s → 46/33/59 m. 15 s takes the bad
+// race from 115 → 62 m at ~zero cost to the healthy two; below it the healthy
+// races start paying. Safety is NOT this threshold — the rung still requires
+// dS >= STEP_MOVE_MIN_STEPS, so a genuine standstill (no steps) never fires it.
+const STEP_PIN_EPISODE_S   = 15;    // == SHADOW_STILL_WINDOW_MS / 1000
 const STEP_SHARE_MAX       = 0.60;  // step metres ≤ this share of the score...
 const STEP_SHARE_UNCAL     = 0.30;  // ...and only this much before λ is calibrated
 const STEP_CLEAN_FOR_CAL   = 3;     // clean segments before the full share releases
@@ -1269,7 +1279,9 @@ function shadowSxSegment(sh, dS, T, snap) {
   // the stillness that happens to land inside it (see the note in shadowV2Step).
   // A 40 s pin now marks every segment it spans, instead of neither.
   const epStillS = SERVER_STEP_PIN_EPISODE ? (sh.stillEpPeak || 0) : 0;
-  const pinned  = stillS >= STEP_PIN_STILL_S || epStillS >= STEP_PIN_STILL_S;
+  // Flag off ⇒ epStillS is 0 and the bar stays 20 s ⇒ byte-identical to before.
+  const pinS = SERVER_STEP_PIN_EPISODE ? STEP_PIN_EPISODE_S : STEP_PIN_STILL_S;
+  const pinned  = stillS >= pinS || epStillS >= pinS;
   // Carry an OPEN episode's elapsed forward (so its later segments still read as
   // pinned); a closed one resets, so a fresh segment is never tainted by history.
   sh.stillEpPeak = sh.still ? (sh.stillEpS || 0) : 0;
