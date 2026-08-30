@@ -431,6 +431,11 @@ const STEP_CLEAN_FOR_CAL   = 3;     // clean segments before the full share rele
 // untrimmed (no steps, but real displacement). Accumulates + flushes always
 // (meta.fuse.up/dn); SERVER_STEP_BLEND=1 is the separate flip that SCORES it.
 const SERVER_STEP_BLEND    = process.env.SERVER_STEP_BLEND === '1';
+// R-145p: episode-based pin trigger (see shadowV2Step). DEFAULT OFF — measured
+// on the only three real traces we have it is net-neutral (race ec9d48d8 -6 m,
+// b380925b +4 m), so it ships dark like every other scoring change here and
+// waits for evidence. The bookkeeping it needs runs regardless and is inert.
+const SERVER_STEP_PIN_EPISODE   = process.env.SERVER_STEP_PIN_EPISODE === '1';
 const STEP_BLEND_W_BASE    = 0.40;  // steps' weight in a fully healthy segment
                                     // (harmless there — est≈gps — but it is what
                                     // lets the blend act on degradation that
@@ -947,6 +952,9 @@ function shadowV2Reset(sh) {
   sh.k = null; sh.sx = null; sh.sy = null;
   sh.win = []; sh.credAnchor = null;
   sh.pendM = 0; sh.still = false; sh.v2LastTs = 0;
+  // R-145p: a teleport/gap makes the track discontinuous, so any in-flight
+  // still-episode measurement is void — never let one span the discontinuity.
+  sh.stillEpT0 = 0; sh.stillEpS = 0;
 }
 
 // One accepted fix through the v2 pipeline: smooth → stationarity → credit.
@@ -1025,6 +1033,24 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
     sh.pendM = 0;
   }
 
+  // R-145p: still-EPISODE bookkeeping, for the pinned step rung.
+  // stillS (the segment's stillMs delta) can only reach STEP_PIN_STILL_S=20 when
+  // an ENTIRE segment is still — and segments are ~20 s because sx is sampled at
+  // most 1/20 s. So the pin trigger sat exactly on the sampling cadence: a real
+  // 40 s pin split across two boundaries gives each segment ~20 s and each half
+  // falls short. Measured on race ec9d48d8 (2026-08-30): 10 episodes / 144 s of
+  // pinning banked ZERO step metres while the racer lost 163 m against the phone
+  // in the same pocket. Tracking the EPISODE's own elapsed stillness decouples
+  // the trigger from where the sx boundaries happen to fall. Bookkeeping only —
+  // this block credits nothing and cannot change GPS distance.
+  if (sh.still && !wasStill) sh.stillEpT0 = t;              // episode opened
+  if (sh.still && sh.stillEpT0) {
+    sh.stillEpS = Math.max(0, (t - sh.stillEpT0) / 1000);
+    if (sh.stillEpS > (sh.stillEpPeak || 0)) sh.stillEpPeak = sh.stillEpS;
+  }
+  if (!sh.still && wasStill) sh.stillEpT0 = 0;              // episode closed;
+  // peak survives until the next segment reads it (shadowIngestSx clears it).
+
   if (sh.still) {
     sh.zuptN++;
     sh.k.zupt();
@@ -1066,6 +1092,8 @@ function shadowIngest(st, fx) {
                               k: null, sx: null, sy: null, v2LastTs: 0,
                               smoothRawM: 0, stillM: 0, floorM: 0, capM: 0,
                               win: [], still: false, stillMs: 0, zuptN: 0,
+                              // R-145p still-episode tracking (pin trigger)
+                              stillEpT0: 0, stillEpS: 0, stillEpPeak: 0,
                               credAnchor: null, pendM: 0,
                               starvM: 0, starvN: 0, starvSec: 0,
                               // R-143 step fusion (inert until sx samples arrive)
@@ -1237,7 +1265,14 @@ function shadowSxSegment(sh, dS, T, snap) {
   // Degraded rung (starved delivery / pinned position): steps carry the
   // segment outright — the R-143 behavior, unchanged.
   const starved = fixHz < STEP_STARVED_MAX_FIXHZ;
-  const pinned  = stillS >= STEP_PIN_STILL_S;
+  // R-145p: fire on the longest still EPISODE touching this segment, not just on
+  // the stillness that happens to land inside it (see the note in shadowV2Step).
+  // A 40 s pin now marks every segment it spans, instead of neither.
+  const epStillS = SERVER_STEP_PIN_EPISODE ? (sh.stillEpPeak || 0) : 0;
+  const pinned  = stillS >= STEP_PIN_STILL_S || epStillS >= STEP_PIN_STILL_S;
+  // Carry an OPEN episode's elapsed forward (so its later segments still read as
+  // pinned); a closed one resets, so a fresh segment is never tainted by history.
+  sh.stillEpPeak = sh.still ? (sh.stillEpS || 0) : 0;
   if (starved || pinned) {
     if (dS < STEP_MOVE_MIN_STEPS) return;
     const add = Math.max(0, est - gps);
