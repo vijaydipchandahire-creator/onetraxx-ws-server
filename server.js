@@ -359,6 +359,39 @@ const SHADOW_RESET_GAP_MS    = 30000;
 // SCORE (rung 1 becomes seedM + min(credM + starvM, rawM)). Default 0 = dry
 // run: read the would-be credit off telemetry before any result depends on it.
 const SERVER_STARVATION_LADDER = process.env.SERVER_STARVATION_LADDER === '1';
+// ── R-143 step-displacement fusion (DRY-RUN by default) ──────────────────────
+// The pocket-race residual: two same-pocket phones diverge 40-70% because one
+// stops OBSERVING the walk — battery-managed delivery starvation (room e0f2ac3b:
+// 39 vs 108 fixes, one 197 s gap) or "pinned" fixes repeating a near-frozen
+// position with optimistic accuracy so the still-gate flags a walking racer
+// stationary (room 9467137d: stillSec 200 vs 28 on ~equal fix counts). No
+// GPS-side filter recovers coverage that was never delivered; the hardware step
+// counter observes 100% of the walk on every device (sensor-hub, survives JS
+// freeze/Doze, immune to pocket RF). Clients piggyback sx = [[ts, cumSteps], …]
+// beside fx; the server segments the stream between samples, learns a per-user
+// stride λ ONLY from clean-GPS segments, and banks λ·ΔS into stepM for segments
+// GPS provably missed (starved or pinned), clamped per segment to
+// [net chord, 12 m/s × duration]. Anti-cheat: no step credit until ≥1 clean GPS
+// segment exists (treadmill/shake earn nothing — λ never calibrates), cadence
+// cap 3.3 steps/s, λ clamp, and a share cap so step metres can never carry more
+// than STEP_SHARE_MAX of the score. stepM always accumulates + logs + flushes
+// (meta.fuse); SERVER_STEP_FUSION=1 is the separate flip that lets it SCORE.
+const SERVER_STEP_FUSION   = process.env.SERVER_STEP_FUSION === '1';
+const STEP_LAMBDA_PRIOR    = 0.75;  // m/step population prior (fleet: 1.0-1.4 steps/m)
+const STEP_LAMBDA_MIN      = 0.35;  // physiological clamp on the learned stride
+const STEP_LAMBDA_MAX      = 1.60;  // (covers running; tune from meta.fuse.lam)
+const STEP_LAMBDA_ALPHA    = 0.25;  // EWMA gain per clean segment
+const STEP_SEG_MIN_S       = 10;    // segments shorter than this keep accumulating
+const STEP_SEG_MAX_S       = 900;   // longer = void (clock glitch / hours-stale sample)
+const STEP_CLEAN_MIN_STEPS = 25;    // λ calibration needs a real stride sample
+const STEP_CLEAN_MIN_FIXHZ = 0.25;  // accepted fixes/s for a "clean" segment (≥1 per 4 s)
+const STEP_STARVED_MAX_FIXHZ = 0.125; // under 1 fix per 8 s = starved delivery
+const STEP_MOVE_MIN_STEPS  = 20;    // "steps say moving" per segment (~40 spm floor)
+const STEP_CADENCE_MAX_SPS = 3.3;   // beyond this = shaking, segment rejected
+const STEP_PIN_STILL_S     = 20;    // still-flagged seconds before the pinned override
+const STEP_SHARE_MAX       = 0.60;  // step metres ≤ this share of the score...
+const STEP_SHARE_UNCAL     = 0.30;  // ...and only this much before λ is calibrated
+const STEP_CLEAN_FOR_CAL   = 3;     // clean segments before the full share releases
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
 // still runs on the budgeted client claim. C1 = flip SERVER_AUTHORITATIVE_DISTANCE
@@ -968,6 +1001,10 @@ function shadowIngest(st, fx) {
                               win: [], still: false, stillMs: 0, zuptN: 0,
                               credAnchor: null, pendM: 0,
                               starvM: 0, starvN: 0, starvSec: 0,
+                              // R-143 step fusion (inert until sx samples arrive)
+                              sxLast: null, sxSnap: null, sxLog: [], sxDrop: 0,
+                              lambda: STEP_LAMBDA_PRIOR, lamN: 0,
+                              stepM: 0, stepN: 0, stepSec: 0, pinM: 0,
                               nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
                               seedM: 0, lastFxWallTs: 0 };
   // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
@@ -981,7 +1018,7 @@ function shadowIngest(st, fx) {
   // them as meta.fin*. One site, fail-soft, never touches crediting itself.
   if (st.finished && !sh.finSnap) {
     sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
-                   starvM: sh.starvM, ts: sh.lastTs, wall: Date.now() };
+                   starvM: sh.starvM, stepM: sh.stepM, ts: sh.lastTs, wall: Date.now() };
   }
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
   for (const f of list) {
@@ -1026,6 +1063,112 @@ function shadowIngest(st, fx) {
   }
 }
 
+// ── R-143: feed one message's step-ledger samples into the fusion state ──────
+// sx = [[tsMs, cumulativeSteps], …] — client-supplied, so every guard is
+// load-bearing (same posture as fx). Segments are the interval between two
+// consecutive ACCEPTED samples; a device frozen for minutes simply produces one
+// long segment — same code path, no interpolation into spans we know nothing
+// about. Runs only when a shadow accumulator already exists: step credit is
+// meaningless without a GPS stream to calibrate against (and the release gate
+// below requires one anyway).
+function shadowIngestSx(st, sx) {
+  const sh = st.shadow;
+  if (!sh) return;
+  for (const s of sx) {
+    if (!Array.isArray(s) || s.length < 2) { sh.sxDrop++; continue; }
+    const [ts, cum] = s;
+    if (!Number.isFinite(ts) || !Number.isFinite(cum) || cum < 0) { sh.sxDrop++; continue; }
+    if (sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
+    if (!sh.sxLast) {
+      // First sample anchors the first segment: snapshot the GPS accumulators
+      // so the next sample can read this segment's deltas.
+      sh.sxLast = { t: ts, c: cum };
+      sh.sxSnap = shadowSxSnap(sh);
+      continue;
+    }
+    const dS = cum - sh.sxLast.c;
+    const T = (ts - sh.sxLast.t) / 1000;
+    if (dS < 0 || T <= 0) {
+      // Counter went backwards (reboot reset the hub ledger) or clock ran
+      // backwards: void the segment entirely — never "recover" it.
+      sh.sxDrop++;
+      sh.sxLast = { t: ts, c: cum };
+      sh.sxSnap = shadowSxSnap(sh);
+      continue;
+    }
+    if (T < STEP_SEG_MIN_S) continue;   // segment still accumulating; keep the anchor
+    const snap = sh.sxSnap || shadowSxSnap(sh);
+    if (T <= STEP_SEG_MAX_S) shadowSxSegment(sh, dS, T, snap);
+    else sh.sxDrop++;                   // absurd span — void, credit nothing
+    sh.sxLast = { t: ts, c: cum };
+    sh.sxSnap = shadowSxSnap(sh);
+  }
+}
+
+// GPS-accumulator snapshot at a segment boundary — the next boundary diffs it.
+function shadowSxSnap(sh) {
+  return { credM: sh.credM, starvM: sh.starvM, stillMs: sh.stillMs, n: sh.n,
+           la: sh.last ? sh.last.la : null, ln: sh.last ? sh.last.ln : null };
+}
+
+// Close one step segment: calibrate λ from it if the GPS inside was clean, or
+// bank step-distance if GPS provably missed it (starved or pinned). Every
+// branch is bounded; a segment that fits neither classification credits nothing.
+function shadowSxSegment(sh, dS, T, snap) {
+  const cadence = dS / T;
+  if (cadence > STEP_CADENCE_MAX_SPS) { sh.sxDrop++; return; }   // shaking, not walking
+  const credDelta  = Math.max(0, sh.credM - snap.credM);
+  const starvDelta = Math.max(0, sh.starvM - snap.starvM);
+  const stillS     = Math.max(0, (sh.stillMs - snap.stillMs) / 1000);
+  const fixHz      = Math.max(0, sh.n - snap.n) / T;
+  // Net chord across the segment: a hard LOWER bound on true path length —
+  // this is what lets stepM subsume the R-141 gap chord without double-count.
+  const netM = (snap.la != null && sh.last && Number.isFinite(sh.last.la))
+    ? haversineM(snap.la, snap.ln, sh.last.la, sh.last.ln) : 0;
+
+  // λ calibration — ONLY from clean segments (good fix cadence, not still,
+  // enough steps for a real sample, ratio inside the physiological band).
+  // Never from step-carried segments: no bootstrap loop, ever.
+  if (fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_CLEAN_MIN_STEPS && credDelta > 0) {
+    const ratio = credDelta / dS;
+    if (ratio >= STEP_LAMBDA_MIN && ratio <= STEP_LAMBDA_MAX) {
+      sh.lambda = sh.lamN === 0 ? ratio
+                : sh.lambda + STEP_LAMBDA_ALPHA * (ratio - sh.lambda);
+      sh.lamN++;
+    }
+    return;   // clean GPS scored this segment already — steps add nothing here
+  }
+
+  // Degraded-window rung. Release gate: zero step credit until this racer has
+  // produced at least one clean GPS segment this race — a treadmill or a
+  // shaken phone never calibrates and never earns a metre.
+  if (sh.lamN < 1 || dS < STEP_MOVE_MIN_STEPS) return;
+  const starved = fixHz < STEP_STARVED_MAX_FIXHZ;
+  const pinned  = stillS >= STEP_PIN_STILL_S;
+  if (!starved && !pinned) return;
+  const lam = Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lambda));
+  // clamp(λ·ΔS, netM, 12·T), minus whatever GPS already credited inside the
+  // segment (cred + banked gap chords) so the rungs never stack.
+  const est = Math.min(Math.max(lam * dS, netM), T * SHADOW_MAX_CREDIT_MPS);
+  const add = Math.max(0, est - credDelta - starvDelta);
+  if (add <= 0) return;
+  sh.stepM += add;
+  sh.stepN++;
+  sh.stepSec += Math.round(T);
+  if (pinned && !starved) sh.pinM += add;
+}
+
+// Step metres eligible to SCORE: the share cap bounds the blast radius of a
+// wholly forged sx stream — step credit can carry at most STEP_SHARE_MAX of
+// the final score (STEP_SHARE_UNCAL before λ has STEP_CLEAN_FOR_CAL clean
+// segments). base·s/(1-s) is the algebra of "stepM ≤ s·(base+stepM)".
+function stepScoreM(sh) {
+  if (!sh || !sh.stepM) return 0;
+  const base = sh.seedM + Math.min(sh.credM + sh.starvM, sh.rawM);
+  const share = sh.lamN >= STEP_CLEAN_FOR_CAL ? STEP_SHARE_MAX : STEP_SHARE_UNCAL;
+  return Math.min(sh.stepM, base * share / (1 - share));
+}
+
 // ── Phase C ladder (see SHADOW_PHASE_C_DESIGN.md §2) ─────────────────────────
 // Rung 1: v2 credit while the fix stream is fresh. Rung 2: today's budgeted
 // claim (computed EVERY frame regardless — its st fields feed eviction and the
@@ -1041,7 +1184,13 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   // still inside the rawM clamp, so credit can never exceed the raw path.
   // Dry-run (the default) leaves scoring EXACTLY as before; starvM is telemetry.
   const starvM = (SERVER_STARVATION_LADDER && sh) ? sh.starvM : 0;
-  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM + starvM, sh.rawM)) : budgetM;
+  // R-143 step rung: step metres sit OUTSIDE the rawM clamp deliberately — in a
+  // pinned/starved stretch rawM itself is starved of truth, which is exactly
+  // when this rung exists. Its own bounds (per-segment clamp, cadence, release
+  // gate, share cap inside stepScoreM) carry the invariant instead. Dry-run
+  // (the default) leaves scoring EXACTLY as before; stepM is telemetry.
+  const stepM = (SERVER_STEP_FUSION && sh) ? stepScoreM(sh) : 0;
+  let authM = fxFresh ? (sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : budgetM;
   authM = Math.max(st.authDist || 0, authM);
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
@@ -1054,7 +1203,8 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
     log(`AUTH-DELTA room=${roomId} user=${userId} rung=${fxFresh ? 1 : 2} ` +
         `auth=${Math.round(authM)} budget=${Math.round(budgetM)} drift=${Math.round(authM - budgetM)} ` +
         `r1=${st.authR1 || 0}/${st.authN}` +
-        (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : ''));
+        (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : '') +
+        (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
@@ -1185,6 +1335,17 @@ function flushShadow(roomId, room, via) {
                        sec: sh.starvSec, live: SERVER_STARVATION_LADDER };
       }
       if (sh.finSnap && sh.finSnap.starvM) meta.finStarvM = Math.round(sh.finSnap.starvM);
+      // R-143 step-fusion readout: metres the step rung banked (pinM = the
+      // pinned-override share of it), segments, λ and its clean-sample count,
+      // and whether it SCORED. The dry-run go/no-go reads: on a pocket race the
+      // degraded device's cred + starv + fuse.m ≈ the healthy device's credit;
+      // on healthy/parked/shake races fuse.m ≈ 0 (absent = no segments banked).
+      if (sh.stepN || sh.lamN || sh.sxDrop) {
+        meta.fuse = { m: Math.round(sh.stepM), n: sh.stepN, sec: sh.stepSec,
+                      pinM: Math.round(sh.pinM), lam: Math.round(sh.lambda * 100) / 100,
+                      lamN: sh.lamN, drop: sh.sxDrop, live: SERVER_STEP_FUSION };
+      }
+      if (sh.finSnap && sh.finSnap.stepM) meta.finStepM = Math.round(sh.finSnap.stepM);
       // cred≤raw is a published invariant (register R-100 col 15). The CV
       // filter can overshoot through speed changes and mint smoothed length
       // beyond the raw path (LG 2f314303: smooth 611 / raw 598 / cred 605), so
@@ -1199,7 +1360,7 @@ function flushShadow(roomId, room, via) {
       // values ARE the finish values then). finM carries the cred≤raw clamp.
       if (st.finished && !sh.finSnap) {
         sh.finSnap = { credM: sh.credM, rawM: sh.rawM, authM: st.authDist || 0,
-                       starvM: sh.starvM, ts: sh.lastTs, wall: Date.now() };
+                       starvM: sh.starvM, stepM: sh.stepM, ts: sh.lastTs, wall: Date.now() };
       }
       if (sh.finSnap) {
         meta.finM    = Math.round(Math.min(sh.finSnap.credM, sh.finSnap.rawM));
@@ -1225,7 +1386,8 @@ function flushShadow(roomId, room, via) {
         `client=${row.client_m} n=${sh.n} drops=${JSON.stringify(sh.drop)} via=${via}` +
         (SERVER_SHADOW_V2
           ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}` +
-            (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '')
+            (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
+            (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
@@ -1234,7 +1396,10 @@ function flushShadow(roomId, room, via) {
       .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
     if (SHADOW_PERSIST_FIXES && sh.fx && sh.fx.length) {
       supabase.from('race_shadow_fixes')
-        .upsert({ room_id: roomId, user_id: userId, fixes: sh.fx, n: sh.fx.length, meta: { via } },
+        .upsert({ room_id: roomId, user_id: userId, fixes: sh.fx, n: sh.fx.length,
+                  // sx alongside the fixes so offline replay can re-run the
+                  // fusion against the same race (bounded at 400 samples).
+                  meta: sh.sxLog && sh.sxLog.length ? { via, sx: sh.sxLog } : { via } },
                 { onConflict: 'room_id,user_id', ignoreDuplicates: true })
         .then(({ error }) => { if (error) log('SHADOW-FIX upsert failed', roomId, userId, error.message); })
         .catch((e) => log('SHADOW-FIX upsert error', roomId, userId, e && e.message));
@@ -2108,6 +2273,12 @@ wss.on('connection', async (ws, req) => {
         // and the gc flush overwrote the clean terminal row).
         if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.fx) && payload.fx.length) {
           shadowIngest(st, payload.fx);
+        }
+        // R-143: step-ledger samples ride the same message. AFTER shadowIngest
+        // so a segment closing on this frame sees this frame's fixes; the sx
+        // cap (40/msg client-side, resliced here) bounds the loop like fx's.
+        if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.sx) && payload.sx.length) {
+          shadowIngestSx(st, payload.sx.slice(0, 60));
         }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
         const distM = st ? authoritativeDistance(roomId, room, st, ws.userId, payload.distance_m, nowTs)
