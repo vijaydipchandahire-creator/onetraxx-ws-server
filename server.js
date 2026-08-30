@@ -119,6 +119,28 @@ const CLOSE_ROOM_FULL   = 4002; // racer or spectator cap reached
 const FANOUT_EVENTS = new Set([
   'chat', 'voice_msg', 'cheer', 'finished', 'racer_quit', 'false_start', 'race_over',
 ]);
+// R-154(d): human-cadence events a buggy/hostile client could spam — each one
+// fans out to up to 27 peers immediately, unbatched. Token window per socket;
+// beyond the cap the event is silently dropped (logged once per window).
+// finished/racer_quit/race_over are deliberately EXCLUDED: they are idempotent
+// state events with their own guards, and a legit finish retry must never drop.
+const CHATTY_EVENTS = new Set(['chat', 'voice_msg', 'cheer', 'false_start']);
+const CHATTY_WINDOW_MS = 5000;
+const CHATTY_MAX_PER_WINDOW = 25;   // ~5/s sustained — far above human cadence
+function chattyAllowed(ws) {
+  const now = Date.now();
+  if (!ws.chatWinStart || now - ws.chatWinStart >= CHATTY_WINDOW_MS) {
+    ws.chatWinStart = now;
+    ws.chatCount = 0;
+    ws.chatLimitLogged = false;
+  }
+  if (++ws.chatCount <= CHATTY_MAX_PER_WINDOW) return true;
+  if (!ws.chatLimitLogged) {
+    ws.chatLimitLogged = true;
+    log(`CHATTY rate-limited user=${ws.userId} n=${ws.chatCount}`);
+  }
+  return false;
+}
 
 const BATCH_INTERVAL_MS = 1000;   // GPS fan-out cadence
 const PING_INTERVAL_MS  = 30000;  // dead-connection sweep
@@ -590,11 +612,19 @@ function send(ws, message) {
 }
 
 // Send to every client in the room, optionally excluding one (the sender).
+// R-154(d): a stalled socket (dead radio the ping sweep hasn't reaped yet)
+// buffers every send unboundedly in ws. Skip fire-and-forget broadcasts to a
+// client whose kernel/user-space buffer is already deep — the next gps_batch/
+// presence supersedes anything dropped, and TERMINAL delivery does not go
+// through here (sendTerminalWithRetry keeps its own bounded retry, untouched).
+const BROADCAST_MAX_BUFFERED = 1_000_000; // ~1MB ≈ many seconds of batches
 function broadcast(room, message, exceptWs) {
   const data = JSON.stringify(message);
   for (const client of room.clients) {
     if (client === exceptWs) continue;
-    if (client.readyState === WebSocket.OPEN) client.send(data);
+    if (client.readyState !== WebSocket.OPEN) continue;
+    if (client.bufferedAmount > BROADCAST_MAX_BUFFERED) continue;
+    client.send(data);
   }
 }
 
@@ -603,6 +633,19 @@ function broadcast(room, message, exceptWs) {
 // races the finisher's teardown. Pin the terminal payload on the room so a
 // socket that (re)joins later still gets it, and re-send per client until acked.
 function deliverTerminal(room, roomId, payload, exceptWs) {
+  // R-150: first-write-wins. Every server-initiated caller already checks
+  // room.terminal before calling; the race_over relay path (and
+  // maybeServerFinalize's delivery) did not — so a duplicate race_over (a
+  // client retry after a missed ack, or a second elected driver) re-minted the
+  // mid, invalidated every client's ackedTerminalMid, re-ran the bounded retry
+  // fan-out, could overwrite the reason clients saw, and reset terminal.at
+  // (delaying the spectator-linger close). The retry machinery below already
+  // keeps re-sending the FIRST terminal until acked, so a duplicate adds
+  // nothing a survivor needs.
+  if (room.terminal) {
+    log(`TERMINAL duplicate suppressed room=${roomId} reason=${payload && payload.reason} kept=${room.terminal.payload && room.terminal.payload.reason}`);
+    return;
+  }
   room.terminal = { payload, mid: `${roomId}:${Date.now()}`, at: Date.now() };
   log(`TERMINAL room=${roomId} reason=${payload && payload.reason}`);
   flushShadow(roomId, room, 'terminal');
@@ -1734,11 +1777,15 @@ async function ensureBudgetMeta(roomId, room) {
   // sitting at 1 Hz does not turn into a request per frame.
   const haveAnchor = room.meta && room.meta.activity !== undefined && room.meta.startedAt;
   if (haveAnchor) return;
-  if (room.meta && room.meta.activity !== undefined) {
-    const now = Date.now();
-    if (room.metaRetryAt && now < room.metaRetryAt) return;
-    room.metaRetryAt = now + 10000;
-  }
+  // R-154(h): the 10s throttle used to apply only once meta carried an activity
+  // key — but evictRacer and maybeCompleteRace set room.meta WITHOUT one, and a
+  // room whose race_rooms read keeps failing never populates it, so every gps
+  // frame re-triggered the fetch (serialized by metaFetching into a continuous
+  // back-to-back request loop). Unconditional now: the very first fetch is
+  // unthrottled (metaRetryAt unset), every retry waits 10s.
+  const now = Date.now();
+  if (room.metaRetryAt && now < room.metaRetryAt) return;
+  room.metaRetryAt = now + 10000;
   room.metaFetching = true;
   try {
     const { data: r } = await supabase
@@ -1940,7 +1987,13 @@ function contradictsCompletion(room) {
 }
 
 async function maybeCompleteRace(roomId, room) {
-  if (!supabase || room.terminal || room.completing) return;
+  if (!supabase || room.terminal) return;
+  // R-151: a check that lands while another is in flight used to return here and
+  // was LOST — scheduleCompletionCheck had already nulled completeTimer, and some
+  // triggers (st.goneNotified's 90s-gone) fire exactly once, so the room could
+  // sit 'racing' until the 15-min cron rule. Remember that a re-check was asked
+  // for; the in-flight run re-arms it from its finally block.
+  if (room.completing) { room.completeRecheck = true; return; }
   room.completing = true;
   try {
     const [{ data: rawMembers, error: mErr }, { data: results, error: rErr }] = await Promise.all([
@@ -2066,7 +2119,16 @@ async function maybeCompleteRace(roomId, room) {
       }
     }
   } catch (e) { log('SERVER-COMPLETE error', roomId, e && e.message); }
-  finally { room.completing = false; }
+  finally {
+    room.completing = false;
+    // R-151: replay any completion signal that arrived mid-flight. Goes through
+    // scheduleCompletionCheck so it keeps the debounce and the terminal guard —
+    // if this run just delivered the terminal, the re-arm is a no-op.
+    if (room.completeRecheck) {
+      room.completeRecheck = false;
+      scheduleCompletionCheck(roomId, room);
+    }
+  }
 }
 // ── end eviction policy functions ────────────────────────────────────────────
 
@@ -2439,6 +2501,8 @@ wss.on('connection', async (ws, req) => {
 
       // Everything else that the room cares about is relayed to the others.
       if (FANOUT_EVENTS.has(event)) {
+        // R-154(d): drop over-cadence chat/cheer spam before it costs a fan-out.
+        if (CHATTY_EVENTS.has(event) && !chattyAllowed(ws)) return;
         // Terminal event: reliable fan-out (ack + bounded retry) instead of a
         // fire-and-forget relay — the sender navigates away and drops its socket
         // immediately, but survivors must still end their HUD.
@@ -2546,7 +2610,13 @@ wss.on('connection', async (ws, req) => {
               }
             } else st.quit = true;
           }
-          if (event === 'finished') room.hasFinisher = true;
+          // R-149: only a KNOWN RACER's finish may flip hasFinisher — the flag is
+          // monotonic and permanently disables the room-level inactivity cancel
+          // (roomLevelSweep) and switches maybeCompleteRace's branch. `role` is an
+          // unauthenticated query param, so a spectator could previously grief a
+          // room with one forged 'finished'. st is minted on every racer JOIN and
+          // never deleted, so a legitimate racer always has an entry.
+          if (event === 'finished' && st) room.hasFinisher = true;
           scheduleCompletionCheck(roomId, room);
           // P2: stamp the participant state, then RE-ARM the completion check.
           // The unconditional schedule above is kept exactly as it was, so a slow
@@ -2556,7 +2626,10 @@ wss.on('connection', async (ws, req) => {
           // until some later event happens to schedule it again.
           // Deliberately not awaited by the handler: the broadcast below must not
           // wait on a DB round-trip.
-          void (async () => {
+          // R-149: same known-racer gate — a spectator's forged finished/quit must
+          // not stamp a lifecycle either (their member row, if any, is role
+          // 'spectator' and no lifecycle state of theirs gates completion).
+          if (st) void (async () => {
             await markLifecycle(roomId, ws.userId,
               event === 'finished' ? 'finished' : 'quit',
               event === 'finished' ? 'finish_relay' : 'client_quit');
@@ -2637,6 +2710,13 @@ wss.on('connection', async (ws, req) => {
         room.emptySince = Date.now();
         log(`ROOM EMPTY (kept for eviction timers) room=${roomId}`);
       } else {
+        // R-154(j): mirror the GC branch — a pending completion check must not
+        // fire against the orphaned room object and run DB reads for nothing.
+        // Safe to drop here: this branch means the race is settled (terminal)
+        // or never active, so there is nothing left to complete. The terminal
+        // settle timer is deliberately NOT cleared — settleRoom is documented
+        // safe post-teardown and dropping it could lose a settle.
+        if (room.completeTimer) { clearTimeout(room.completeTimer); room.completeTimer = null; }
         flushShadow(roomId, room, 'room_closed');
         flushReplayCurves(roomId, room, 'room_closed');
         rooms.delete(roomId);
