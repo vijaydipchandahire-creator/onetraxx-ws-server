@@ -505,6 +505,10 @@ const FINISH_CLAIM_DEMOTE     = process.env.FINISH_CLAIM_DEMOTE !== '0';
 const SERVER_DISPLAY_BLEND = process.env.SERVER_DISPLAY_BLEND !== '0';   // kill switch
 const DISPLAY_LEAD_M       = 50;   // max metres display may lead verified credit
 const DISPLAY_FINISH_HOLD_M = 3;   // held short of target until the real crossing
+// R-164: finish-approach authority taper — see displayDistance. Same K as the
+// client's own-avatar taper (HUD_FINISH_TAPER_K) so both ends converge alike.
+const SERVER_FINISH_TAPER = process.env.SERVER_FINISH_TAPER !== '0';   // kill switch
+const DISPLAY_TAPER_K = 0.4;
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
@@ -1399,7 +1403,17 @@ function displayDistance(room, st, authM) {
   // short of target the display parks just under it, and the moment the real
   // CROSSING runs auth to target the clamp vanishes (authM >= targetM path
   // never reaches here — budget cannot exceed an auth already at target-cap).
-  if (targetM > 0 && authM < targetM) d = Math.min(d, targetM - DISPLAY_FINISH_HOLD_M);
+  if (targetM > 0 && authM < targetM) {
+    // R-164 finish-approach taper (peer avatars + replay): display may lead
+    // auth by at most TAPER_K × the remaining authoritative distance, so a
+    // peer's avatar converges onto the line exactly as their crossing fires
+    // instead of parking at target−3 while their credit is still short (the
+    // flat hold is kept as the outer belt). Self-scaling 500m→200km — the cap
+    // dwarfs DISPLAY_LEAD_M until the true finish approach. Kill switch:
+    // SERVER_FINISH_TAPER=0 restores the flat hold alone.
+    if (SERVER_FINISH_TAPER) d = Math.min(d, authM + DISPLAY_TAPER_K * (targetM - authM));
+    d = Math.min(d, targetM - DISPLAY_FINISH_HOLD_M);
+  }
   return d;
 }
 
@@ -1919,7 +1933,10 @@ function budgetedDistance(room, st, claimed, now) {
 // measurement must never cost a frame on the 1 Hz hot path, and must never be able
 // to fail a race. If the write is lost, the measurement is lost — nothing else.
 function recordCrossing(roomId, room, st, userId, accepted) {
-  if (!SERVER_CROSSING_STAMP || !supabase) return;
+  // TEST_MODE (no supabase): fall through to the CROSSING log — the racebot
+  // oracle's witness — and return before the DB writes below. Production
+  // behavior is untouched: supabase is always set there.
+  if (!SERVER_CROSSING_STAMP) return;
   if (st.crossingStamped) return;
   const targetM = room.meta && room.meta.targetM;
   // ABSTAIN while the target is unknown (hydration in flight) — same rule the
@@ -1938,6 +1955,7 @@ function recordCrossing(roomId, room, st, userId, accepted) {
   const elapsed = Math.max(0, now - startedAt);
   log(`CROSSING room=${roomId} user=${userId} elapsed=${elapsed}ms ` +
       `accepted=${Math.round(accepted)} target=${targetM} source=${source}`);
+  if (!supabase) return;   // TEST_MODE: crossing observed via the log line only
   supabase.from('race_crossings').insert({
     room_id: roomId, user_id: userId,
     crossed_at: new Date(now).toISOString(),
@@ -2444,6 +2462,21 @@ wss.on('connection', async (ws, req) => {
       // room was indistinguishable from a dead socket (ISS-03).
       if (event === 'ping') {
         send(ws, { event: 'pong', payload: { ts: payload.ts || Date.now() } });
+        return;
+      }
+
+      // TEST_MODE only (racebot harness): synthetic room metadata. Production
+      // never sets WS_TEST_MODE, so this is dead code there; locally it stands
+      // in for the ensureBudgetMeta DB fetch (fully inert without a supabase
+      // client), which otherwise leaves room.meta unset and the entire
+      // budget/auth/crossing machinery abstaining — a simulated race would
+      // never score or cross. Same field shapes as the real fetch.
+      if (TEST_MODE && event === 'sim_meta') {
+        room.meta = {
+          startedAt: payload.started_at || new Date().toISOString(),
+          targetM: Number(payload.target_m) || 0,
+          activity: payload.activity || 'running',
+        };
         return;
       }
 
