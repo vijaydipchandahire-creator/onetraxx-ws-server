@@ -156,8 +156,12 @@ const TERMINAL_MAX_ATTEMPTS = 4;
 // Server-authoritative: a room accumulates "fully stationary" time only while
 // NO racer reports movement. Any gps >= STATIONARY_KMH resets it. No tap/UI can
 // reset it — only real GPS movement (mirrors the client's 0.222 m/s stall gate).
-const RACE_INACTIVITY_MS      = 10 * 60 * 1000;  // stationary time before the warning
-const RACE_INACTIVITY_WARN_MS = 60 * 1000;       // countdown shown before abandon
+// TEST_MODE-only clock compression for the racebot harness (scripts/racebot.js):
+// the room-level abandon path is the one eviction-family behavior that runs
+// without Supabase, and 11 real-time minutes per scenario is not a test. Both
+// overrides are dead code in production — WS_TEST_MODE is never set there.
+const RACE_INACTIVITY_MS      = (TEST_MODE && Number(process.env.TEST_RACE_INACTIVITY_MS)) || 10 * 60 * 1000;  // stationary time before the warning
+const RACE_INACTIVITY_WARN_MS = (TEST_MODE && Number(process.env.TEST_RACE_INACTIVITY_WARN_MS)) || 60 * 1000;   // countdown shown before abandon
 const INACTIVITY_TICK_MS      = 5000;            // sweep cadence
 const STATIONARY_KMH          = 0.8;             // == 0.222 m/s (client stall gate)
 
@@ -361,7 +365,19 @@ const SHADOW_FLOOR_ACC_K     = 0.5;    // = client GPS_NOISE_ACCURACY_K
 // only, never a gate.
 const SHADOW_STILL_WINDOW_MS = 15000;
 const SHADOW_STILL_NET_M     = 5;
-const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS; cycling out of scope
+const SHADOW_MAX_CREDIT_MPS  = 12;     // = client GPS_MAX_CREDIT_MS (foot sports)
+// R-165 (two real rides, 2026-09-03, rooms eb5c1399/49d78617): the flat 12 m/s cap
+// FIRED on a flat cycling ride during a 7-8 s burst at 40-46 km/h — 62-92 m per
+// 2 km dropped on BOTH phones (capM), replay-verified. Cycling credits to 20 m/s
+// (72 km/h) and its jump ceiling is the physical 25 m/s (= client GPS_PHYS_MAX_MS).
+// Between the foot ceiling and the cycling ceiling a chord must be corroborated by
+// Doppler — a real 44 km/h burst reads ~44 km/h on Doppler, while the cold-start
+// jumps in the same rides (66 and 96 km/h chords) read 0.7 and 14 km/h. The
+// per-activity distance budget (100 km/h) still bounds the cheat window. Client
+// mirror: SPORT_CREDIT_CAP_MS in src/lib/constants.js — keep in lockstep.
+const SHADOW_CREDIT_CAP_MPS_BY_ACT = { cycling: 20 };
+const SHADOW_TELEPORT_MPS_BY_ACT   = { cycling: 25 };
+const SHADOW_TELEPORT_DOPPLER_K    = 2.5;   // chord speed > K×Doppler + 2 m/s = jump
 // A delivery gap longer than this re-seeds the filter and anchors: v2 never
 // credits across a suspension gap (raw_m still measures the gap chord, as v1 did).
 const SHADOW_RESET_GAP_MS    = 30000;
@@ -992,7 +1008,7 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
       // positions wander a few metres apart must net to zero credit.
       const noise = Math.max(SHADOW_FLOOR_M, SHADOW_FLOOR_ACC_K * accPrev)
                   + Math.max(SHADOW_FLOOR_M, SHADOW_FLOOR_ACC_K * accCur);
-      const credit = Math.min(chord, gapS * SHADOW_MAX_CREDIT_MPS);
+      const credit = Math.min(chord, gapS * shCapMps(sh));
       if (credit > noise) {
         sh.starvM += credit;
         sh.starvN++;
@@ -1086,7 +1102,7 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
   const fromCred = Math.hypot(r.x - sh.credAnchor.x, r.y - sh.credAnchor.y);
   if (fromCred >= floor) {
     const dtS = Math.max(0.001, (t - sh.credAnchor.t) / 1000);
-    if (fromCred / dtS > SHADOW_MAX_CREDIT_MPS) sh.capM += fromCred;
+    if (fromCred / dtS > shCapMps(sh)) sh.capM += fromCred;
     else sh.credM += fromCred;
     sh.floorM += Math.max(0, sh.pendM - fromCred);
     sh.pendM = 0;
@@ -1098,7 +1114,11 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
 // numeric guard here is load-bearing: fx is client-supplied and must never be
 // able to poison the accumulator or throw (the caller runs inside the M-3
 // message guard, but a NaN would corrupt silently, not loudly).
-function shadowIngest(st, fx) {
+// R-165 per-activity caps (set on sh by shadowIngest; foot defaults until room meta hydrates).
+function shCapMps(sh)  { return (sh && sh.capMps)  || SHADOW_MAX_CREDIT_MPS; }
+function shTeleMps(sh) { return (sh && sh.teleMps) || SHADOW_TELEPORT_MPS; }
+
+function shadowIngest(st, fx, activity) {
   let sh = st.shadow;
   if (!sh) sh = st.shadow = { last: null, rawM: 0, credM: 0, n: 0, firstTs: 0, lastTs: 0,
                               drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false,
@@ -1132,6 +1152,10 @@ function shadowIngest(st, fx) {
                    starvM: sh.starvM, stepM: sh.stepM, ts: sh.lastTs, wall: Date.now() };
   }
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
+  // R-165: per-activity caps; room meta hydrates on the first frame, so an
+  // early frame with no activity runs at the foot caps and upgrades next frame.
+  sh.capMps  = SHADOW_CREDIT_CAP_MPS_BY_ACT[activity] || SHADOW_MAX_CREDIT_MPS;
+  sh.teleMps = SHADOW_TELEPORT_MPS_BY_ACT[activity]   || SHADOW_TELEPORT_MPS;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
     if (!Array.isArray(f) || f.length < 4) { sh.drop.bad++; continue; }
@@ -1155,7 +1179,12 @@ function shadowIngest(st, fx) {
       const dtS = (t - sh.last.t) / 1000;
       if (dtS <= 0) { sh.drop.order++; continue; }          // out-of-order / duplicate
       const chord = haversineM(sh.last.la, sh.last.ln, la, ln);
-      if (chord / dtS > SHADOW_TELEPORT_MPS) {
+      const chordMps = chord / dtS;
+      const teleMps = shTeleMps(sh);
+      // R-165: above the foot ceiling but under the sport ceiling, Doppler decides.
+      const dopplerJump = chordMps > SHADOW_TELEPORT_MPS && teleMps > SHADOW_TELEPORT_MPS
+        && Number.isFinite(spd) && spd >= 0 && chordMps > SHADOW_TELEPORT_DOPPLER_K * spd + 2;
+      if (chordMps > teleMps || dopplerJump) {
         // Teleport: no credit, but RE-ANCHOR — otherwise one glitch fix poisons
         // every subsequent chord against a stale anchor. v2 re-seeds too: the
         // filter would otherwise smoothly interpolate the glitch into length.
@@ -1273,7 +1302,7 @@ function shadowSxSegment(sh, dS, T, snap) {
   const lam = Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lambda));
   // clamp(λ·ΔS, netM, 12·T): the step-implied distance for this segment. The
   // netM floor keeps vehicles/cycling honest (no steps, real displacement).
-  const est = Math.min(Math.max(lam * dS, netM), T * SHADOW_MAX_CREDIT_MPS);
+  const est = Math.min(Math.max(lam * dS, netM), T * shCapMps(sh));
   const gps = credDelta + starvDelta;
 
   // Degraded rung (starved delivery / pinned position): steps carry the
@@ -1309,7 +1338,7 @@ function shadowSxSegment(sh, dS, T, snap) {
   // undiscounted floor biased the blend upward on noisy-but-honest tracks.
   if (dS < STEP_MOVE_MIN_STEPS) return;
   const netFloor = Math.max(0, netM - 2 * accMean);
-  const estB = Math.min(Math.max(lam * dS, netFloor), T * SHADOW_MAX_CREDIT_MPS);
+  const estB = Math.min(Math.max(lam * dS, netFloor), T * shCapMps(sh));
   let w = STEP_BLEND_W_BASE
         + 0.5 * Math.min(1, (stillS / T) * 2)
         + 0.5 * Math.max(0, 1 - fixHz / 0.5)
@@ -1509,7 +1538,8 @@ function flushShadow(roomId, room, via) {
         smoothRawM: Math.round(sh.smoothRawM),  // smoothed track pre-gating (the pure-Kalman number)
         stillM: Math.round(sh.stillM),          // suppressed while stationary
         floorM: Math.round(sh.floorM),          // sub-floor residue, never released
-        capM: Math.round(sh.capM),              // dropped by the 12 m/s cap
+        capM: Math.round(sh.capM),              // dropped by the credit cap (capMps)
+        capMps: shCapMps(sh),                   // R-165: 12 foot / 20 cycling
         stillSec: Math.round(sh.stillMs / 1000),
         zupt: sh.zuptN,
         nisP50: pct(0.5), nisP90: pct(0.9),
@@ -2507,7 +2537,7 @@ wss.on('connection', async (ws, req) => {
         // sibling: a racer loitering after finishing inflated raw_m 600→5797
         // and the gc flush overwrote the clean terminal row).
         if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.fx) && payload.fx.length) {
-          shadowIngest(st, payload.fx);
+          shadowIngest(st, payload.fx, room.meta && room.meta.activity);
         }
         // R-143: step-ledger samples ride the same message. AFTER shadowIngest
         // so a segment closing on this frame sees this frame's fixes; the sx
