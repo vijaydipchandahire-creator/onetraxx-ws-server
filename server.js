@@ -536,6 +536,25 @@ const SHADOW_NIS_SAMPLE_MAX  = 3000;   // bounded like the client's census sampl
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
+// ── Progress floor (owner policy 2026-09-03, anti-chatroom) ──────────────────
+// Per racer: over a rolling PROGRESS_WINDOW_MS the server-ACCEPTED distance must
+// advance by the sport's floor; otherwise a PROGRESS_WARN_MS countdown, then the
+// racer alone is evicted (progress_timeout → inactivity DNF). Cured by gaining
+// PROGRESS_CURE_FRAC × floor during the warning or by the window recovering.
+// Accepted distance is unforgeable and already carries the step/budget rungs, so
+// a starved-GPS but moving phone still earns progress. Floors are deliberately
+// low (a stationary phone earns ~0 because ZUPT/still suppression zeroes credit):
+// this catches STANDING, not strolling — raise the floor here if strolling
+// becomes the pattern. Supersedes the room-level 10-min stationary clock
+// (ROOM_INACTIVITY, now opt-in) and the per-racer 10-min stationary warning.
+const PROGRESS_FLOOR_ENABLED   = process.env.PROGRESS_FLOOR !== '0';   // kill switch
+const PROGRESS_WINDOW_MS       = (TEST_MODE && Number(process.env.TEST_PROGRESS_WINDOW_MS)) || 5 * 60 * 1000;
+const PROGRESS_GRACE_MS        = (TEST_MODE && Number(process.env.TEST_PROGRESS_GRACE_MS))  || 3 * 60 * 1000;
+const PROGRESS_WARN_MS         = (TEST_MODE && Number(process.env.TEST_PROGRESS_WARN_MS))   || 60 * 1000;
+const PROGRESS_FLOOR_M_BY_ACT  = { walking: 25, running: 25, cycling: 100 };
+const PROGRESS_FLOOR_DEFAULT_M = 25;
+const PROGRESS_CURE_FRAC       = 0.2;
+const ROOM_INACTIVITY_ENABLED  = process.env.ROOM_INACTIVITY === '1';   // retired 2026-09-03; opt-in only
 const SERVER_GONE_GRACE_MS  = 90 * 1000;
 const COMPLETE_DEBOUNCE_MS  = 5000;              // one DB completion check per burst of events
 // A finisher whose race_results write failed has no row, so `settled` in
@@ -1725,7 +1744,24 @@ function scheduleTerminalSettle(roomId, room, reason) {
 // room or an existing finish). Guarded by a DB last_distance_m re-read so a
 // racer alive on the Supabase fallback is never evicted — their timer resets.
 async function evictRacer(roomId, room, userId, reason) {
-  if (!supabase || room.terminal) return;                 // TEST_MODE: fully inert
+  if (room.terminal) return;
+  if (!supabase) {
+    // TEST_MODE (racebot): no DB, but the eviction PROTOCOL is exercised —
+    // mark, notify, and end the room when nobody active remains.
+    if (!TEST_MODE) return;
+    const st = room.racers.get(userId);
+    if (!st || st.evicted || st.finished || st.quit) return;
+    st.evicted = true; st.evictReason = reason; st.evictedAt = Date.now();
+    const dist = Math.max(room.gps.get(userId)?.distance_m || 0, st.lastDist || 0);
+    log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=0 absent_ms=0 test_mode`);
+    let victimWs = null;
+    for (const c of room.clients) if (c.userId === userId) victimWs = c;
+    broadcast(room, { event: 'racer_quit', payload: { user_id: userId, evicted: true } }, victimWs);
+    if (victimWs) send(victimWs, { event: 'evicted', payload: { user_id: userId, reason } });
+    const active = [...room.racers.values()].some(s => !s.evicted && !s.quit && !s.finished);
+    if (!active && !room.hasFinisher) deliverTerminal(room, roomId, { reason: 'inactivity_abandon' });
+    return;
+  }
   const st = room.racers.get(userId);
   if (!st || st.evicted || st.evicting || st.finished || st.quit) return;
   st.evicting = true;
@@ -1947,7 +1983,69 @@ function budgetedDistance(room, st, claimed, now) {
 
   st.acceptedDist = accepted;
   st.acceptedTs = now;
+  progressSample(st, now, accepted);
   return accepted;
+}
+
+// ── Progress floor helpers ───────────────────────────────────────────────────
+function progressSample(st, now, accepted) {
+  const pl = st.progLog || (st.progLog = []);
+  const last = pl[pl.length - 1];
+  if (!last || now - last[0] >= 5000 || accepted > last[1]) pl.push([now, accepted]);
+  // keep exactly one sample at/before the window edge so the reference exists
+  const cutoff = now - PROGRESS_WINDOW_MS - 10000;
+  while (pl.length > 1 && pl[1][0] <= cutoff) pl.shift();
+}
+function progressGain(st, now, startedAt) {
+  const pl = st.progLog;
+  if (!pl || !pl.length) return null;
+  const since = Math.max(now - PROGRESS_WINDOW_MS, startedAt || 0);
+  let ref = null;
+  for (const smp of pl) { if (smp[0] <= since) ref = smp; else break; }
+  if (!ref) ref = pl[0];
+  const cur = Math.max(st.acceptedDist || 0, pl[pl.length - 1][1]);
+  return { gain: cur - ref[1], refTs: ref[0], cur };
+}
+function progressFloorSweep(roomId, room, uid, st, now) {
+  const startedAt = room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0;
+  if (!startedAt || now - startedAt < PROGRESS_GRACE_MS) return;
+  const activity = room.meta && room.meta.activity;
+  const floorM = PROGRESS_FLOOR_M_BY_ACT[activity] || PROGRESS_FLOOR_DEFAULT_M;
+  const g = progressGain(st, now, startedAt);
+  if (!g) return;                                   // no accepted frame yet: nothing to judge
+  if (!st.progWarnDeadline) {
+    // the reference must span (nearly) the whole window, or the whole race if
+    // younger than a window — a late (re)joiner gets a full window first.
+    const need = Math.min(PROGRESS_WINDOW_MS, now - startedAt) - 15000;
+    if (now - g.refTs < need) return;
+    if (g.gain >= floorM) return;
+    st.progWarnDeadline = now + PROGRESS_WARN_MS;
+    st.progWarnBase = g.cur;
+    st.progNeedM = Math.max(1, Math.ceil(floorM * PROGRESS_CURE_FRAC));
+    st.baselineDist = Math.max(st.baselineDist || 0, g.cur);   // evictRacer's DB stand-down baseline
+    const payload = { deadline: st.progWarnDeadline, need_m: st.progNeedM, floor_m: floorM,
+                      window_sec: Math.round(PROGRESS_WINDOW_MS / 1000), gain_m: Math.round(g.gain) };
+    for (const c of room.clients) if (c.userId === uid) {
+      send(c, { event: 'progress_warning', payload });
+      send(c, { event: 'stationary_warning', payload: { deadline: st.progWarnDeadline } });   // pre-OTA clients
+    }
+    log(`PROGRESS-WARN room=${roomId} user=${uid} act=${activity || 'unknown'} gain=${Math.round(g.gain)} floor=${floorM} need=${st.progNeedM}`);
+    return;
+  }
+  const gainedSinceWarn = (st.acceptedDist || 0) - (st.progWarnBase || 0);
+  if (gainedSinceWarn >= st.progNeedM || g.gain >= floorM) {
+    st.progWarnDeadline = 0;
+    for (const c of room.clients) if (c.userId === uid) {
+      send(c, { event: 'progress_cleared', payload: {} });
+      send(c, { event: 'stationary_cleared', payload: {} });
+    }
+    log(`PROGRESS-CLEAR room=${roomId} user=${uid} gained=${Math.round(gainedSinceWarn)}`);
+    return;
+  }
+  if (now >= st.progWarnDeadline) {
+    st.progWarnDeadline = 0;
+    evictRacer(roomId, room, uid, 'progress_timeout');
+  }
 }
 
 // R-64 Part 3, phase 1. Record the instant the ACCEPTED distance first reached the
@@ -2966,7 +3064,9 @@ function perRacerSweep(roomId, room, now) {
     // REQ2: stationary while connected (a disconnected racer is governed by
     // the REQ1 clock instead — the two timers are mutually exclusive).
     if (st.connected) {
-      if (!st.warnDeadline && now - st.lastMoveTs >= STATIONARY_EVICT_MS) {
+      if (PROGRESS_FLOOR_ENABLED) {
+        progressFloorSweep(roomId, room, uid, st, now);     // supersedes the stationary clock
+      } else if (!st.warnDeadline && now - st.lastMoveTs >= STATIONARY_EVICT_MS) {
         maybeWarnStationary(roomId, room, uid, st);
       } else if (st.warnDeadline && now >= st.warnDeadline) {
         evictRacer(roomId, room, uid, 'stationary_timeout');
@@ -3030,7 +3130,7 @@ const inactivityTimer = setInterval(() => {
         }
       }
       if (!room.raceActive || room.terminal) continue;
-      roomLevelSweep(roomId, room, now);
+      if (ROOM_INACTIVITY_ENABLED || !PROGRESS_FLOOR_ENABLED) roomLevelSweep(roomId, room, now);
       if (!room.inactivityWarnDeadline) perRacerSweep(roomId, room, now);
     }
   } catch (e) {
