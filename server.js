@@ -1983,23 +1983,42 @@ function budgetedDistance(room, st, claimed, now) {
 
   st.acceptedDist = accepted;
   st.acceptedTs = now;
-  progressSample(st, now, accepted);
+  progressSample(st, now, accepted, room);
   return accepted;
 }
 
 // ── Progress floor helpers ───────────────────────────────────────────────────
-function progressSample(st, now, accepted) {
+// Epoch = the instant this racer's floor starts measuring: race start for a
+// racer present at GO, the (re)join instant for a state born mid-race. Keyed on
+// JOIN time, not on the first accepted frame — 2026-09-04 room 64128550: two
+// racers both still from GO were judged at 3:03 and 5:03 only because one
+// phone's first fix landed 5 s after GO and the other's 17 s (a 15 s slack on
+// the first-sample age decided it). The reference at the epoch is a synthetic
+// sample carrying the credit the racer already held (zero at GO).
+function progressEpoch(st, startedAt) {
+  return Math.max(startedAt || 0, st.progJoinTs || 0);
+}
+function progressSample(st, now, accepted, room) {
   const pl = st.progLog || (st.progLog = []);
+  if (!pl.length) {
+    const startedAt = room && room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0;
+    const epoch = progressEpoch(st, startedAt);
+    // present at GO → nothing accepted at the epoch; born mid-race → whatever
+    // the DB/hydrate baseline seeded (never more than this first frame).
+    const seed = (startedAt && st.progJoinTs && st.progJoinTs <= startedAt) ? 0
+               : Math.min(accepted, Math.max(st.baselineDist || 0, 0));
+    if (epoch && epoch < now) pl.push([epoch, seed]);
+  }
   const last = pl[pl.length - 1];
   if (!last || now - last[0] >= 5000 || accepted > last[1]) pl.push([now, accepted]);
   // keep exactly one sample at/before the window edge so the reference exists
   const cutoff = now - PROGRESS_WINDOW_MS - 10000;
   while (pl.length > 1 && pl[1][0] <= cutoff) pl.shift();
 }
-function progressGain(st, now, startedAt) {
+function progressGain(st, now, epoch) {
   const pl = st.progLog;
   if (!pl || !pl.length) return null;
-  const since = Math.max(now - PROGRESS_WINDOW_MS, startedAt || 0);
+  const since = Math.max(now - PROGRESS_WINDOW_MS, epoch || 0);
   let ref = null;
   for (const smp of pl) { if (smp[0] <= since) ref = smp; else break; }
   if (!ref) ref = pl[0];
@@ -2011,13 +2030,13 @@ function progressFloorSweep(roomId, room, uid, st, now) {
   if (!startedAt || now - startedAt < PROGRESS_GRACE_MS) return;
   const activity = room.meta && room.meta.activity;
   const floorM = PROGRESS_FLOOR_M_BY_ACT[activity] || PROGRESS_FLOOR_DEFAULT_M;
-  const g = progressGain(st, now, startedAt);
+  const epoch = progressEpoch(st, startedAt);
+  // a state born mid-race (late joiner, or a rejoin this relay had lost) gets a
+  // full window from its own epoch before it can be judged.
+  if (epoch > startedAt && now - epoch < PROGRESS_WINDOW_MS) return;
+  const g = progressGain(st, now, epoch);
   if (!g) return;                                   // no accepted frame yet: nothing to judge
   if (!st.progWarnDeadline) {
-    // the reference must span (nearly) the whole window, or the whole race if
-    // younger than a window — a late (re)joiner gets a full window first.
-    const need = Math.min(PROGRESS_WINDOW_MS, now - startedAt) - 15000;
-    if (now - g.refTs < need) return;
     if (g.gain >= floorM) return;
     st.progWarnDeadline = now + PROGRESS_WARN_MS;
     st.progWarnBase = g.cur;
@@ -2517,7 +2536,10 @@ wss.on('connection', async (ws, req) => {
              // anchor can be the race start rather than the moment of joining —
              // seeding it here would hand a late joiner a full-race allowance in
              // one frame.
-             acceptedDist: 0, acceptedTs: null, trimmed: 0, trimmedM: 0 };
+             acceptedDist: 0, acceptedTs: null, trimmed: 0, trimmedM: 0,
+             // Progress floor epoch (2026-09-04): when THIS racer state was born.
+             // max(startedAt, progJoinTs) is the point the floor measures from.
+             progJoinTs: Date.now() };
       room.racers.set(userId, st);
     }
     st.connected = true; st.disconnectedAt = 0; st.goneNotified = false;
