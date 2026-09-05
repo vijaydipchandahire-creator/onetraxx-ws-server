@@ -477,6 +477,23 @@ const STEP_LAMBDA_WINSOR   = 0.15;  // per-sample λ pull bound once lamN ≥ 5
 const SERVER_AUTH_DRYRUN          = true;   // C0: compute + log AUTH-DELTA
 const SERVER_AUTHORITATIVE_DISTANCE = true;  // C1 LIVE 2026-08-22 — C0 exit criteria passed (6 organic races, rung-1 100%, drift in band); revert = false + reload
 const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to rung 2
+// ── R-168 rung-2 gap bound ───────────────────────────────────────────────────
+// 2026-09-05 race 27e4041f: a racer walked a 30 m box for 10 min, rung 1 had
+// credited 23 m (every segment below the stillness gate), then ONE rung-2 frame
+// during a backgrounded 20 s fix gap handed authM the whole budgeted claim
+// (215 m) — and the ratchet kept it. Rung 2 was designed to carry a locked
+// phone through a fix gap, not to launder the historical deficit between what
+// the client claims and what rung 1 refused. So while fixes are stale, the
+// ladder may only advance from the LAST rung-1 value by what this racer's own
+// rung-1 pace (EMA, capped at the activity speed cap) could have covered over
+// the gap itself, plus a small floor. Anchored on the last rung-1 frame, not on
+// the previous rung-2 frame, so a long gap grows linearly and never compounds.
+// A racer with no rung-1 history yet (legacy client, or a state born mid-gap)
+// keeps the old behaviour — the DB baseline seeds them and rung 1 anchors on
+// its first fresh frame. Kill switch: R168_RUNG2_GAP_BOUND=0 + reload.
+const R168_RUNG2_GAP_BOUND = process.env.R168_RUNG2_GAP_BOUND !== '0';
+const R168_GAP_FLOOR_M     = 5;       // metres any one gap may add beyond pace
+const R168_RATE_TAU_MS     = 60000;   // EMA horizon for the rung-1 credit rate
 // ── R-107 finish-claim guard ─────────────────────────────────────────────────
 // 2026-08-22 race ae772fe4: a racer whose fix stream was degraded all race
 // (rung 1 fresh, but every step below the stillness clamp) held auth=0 while
@@ -1417,14 +1434,46 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   // gate, share cap inside stepScoreM) carry the invariant instead. Dry-run
   // (the default) leaves scoring EXACTLY as before; stepM is telemetry.
   const stepM = sh ? stepScoreM(sh) : 0;   // flag-gated inside; may be negative (blend trim)
-  let authM = fxFresh ? Math.max(0, sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : budgetM;
+  // R-168: rung 2 is bounded by the last rung-1 value + own pace × gap + floor.
+  let rung2M = budgetM;
+  if (!fxFresh && R168_RUNG2_GAP_BOUND && st.r1AnchorTs != null) {
+    const gapMs = Math.max(0, nowTs - st.r1AnchorTs);
+    const activity = room.meta && room.meta.activity;
+    const capMps = ((activity ? (BUDGET_SPEED_CAPS_KMH[activity] || BUDGET_UNKNOWN_CAP_KMH)
+                              : BUDGET_UNKNOWN_CAP_KMH) * BUDGET_MARGIN) / 3.6;
+    const rateMps = Math.min(capMps, Math.max(0, st.r1Rate || 0));
+    const bound = st.r1AnchorDist + rateMps * (gapMs / 1000) + R168_GAP_FLOOR_M;
+    if (budgetM > bound + 0.5) {
+      st.r2Bound = (st.r2Bound || 0) + 1;
+      st.r2HeldM = Math.round((st.r2HeldM || 0) + (budgetM - bound));
+      if (st.r2Bound === 1 || st.r2Bound % 20 === 0) {
+        log(`R168-RUNG2-BOUND room=${roomId} user=${userId} budget=${Math.round(budgetM)} bound=${Math.round(bound)} ` +
+            `anchor=${Math.round(st.r1AnchorDist)} gap=${Math.round(gapMs / 1000)}s rate=${rateMps.toFixed(2)}m/s n=${st.r2Bound}`);
+      }
+    }
+    rung2M = Math.min(budgetM, bound);
+  }
+  let authM = fxFresh ? Math.max(0, sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : rung2M;
   authM = Math.max(st.authDist || 0, authM);
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
   st.authDist = authM;
   st.budgetDist = budgetM;   // display blend reads this; never used for scoring
   st.authN = (st.authN || 0) + 1;
-  if (fxFresh) st.authR1 = (st.authR1 || 0) + 1;
+  if (fxFresh) {
+    st.authR1 = (st.authR1 || 0) + 1;
+    // R-168: rung-1 credit rate (EMA over ~60 s) and the anchor rung 2 grows from.
+    if (st.r1AnchorTs != null) {
+      const dt = nowTs - st.r1AnchorTs;
+      if (dt > 0) {
+        const inst = Math.max(0, (authM - st.r1AnchorDist) / (dt / 1000));
+        const a = Math.min(1, dt / R168_RATE_TAU_MS);
+        st.r1Rate = st.r1Rate == null ? inst : st.r1Rate + a * (inst - st.r1Rate);
+      }
+    }
+    st.r1AnchorTs = nowTs;
+    st.r1AnchorDist = authM;
+  }
   if (SERVER_AUTH_DRYRUN && (!st.authLogTs || nowTs - st.authLogTs >= 60000)) {
     st.authLogTs = nowTs;
     log(`AUTH-DELTA room=${roomId} user=${userId} rung=${fxFresh ? 1 : 2} ` +
@@ -1432,7 +1481,8 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         `r1=${st.authR1 || 0}/${st.authN}` +
         (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : '') +
         (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : '') +
-        (sh && (sh.blendUpM || sh.blendDnM) ? ` blend=+${Math.round(sh.blendUpM)}/-${Math.round(sh.blendDnM)}${SERVER_STEP_BLEND ? '(live)' : '(dry)'}` : ''));
+        (sh && (sh.blendUpM || sh.blendDnM) ? ` blend=+${Math.round(sh.blendUpM)}/-${Math.round(sh.blendDnM)}${SERVER_STEP_BLEND ? '(live)' : '(dry)'}` : '') +
+        (st.r2Bound ? ` r2hold=${st.r2HeldM}/${st.r2Bound}${R168_RUNG2_GAP_BOUND ? '(live)' : '(off)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
