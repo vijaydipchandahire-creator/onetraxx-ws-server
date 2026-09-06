@@ -127,6 +127,9 @@ const FANOUT_EVENTS = new Set([
 const CHATTY_EVENTS = new Set(['chat', 'voice_msg', 'cheer', 'false_start']);
 const CHATTY_WINDOW_MS = 5000;
 const CHATTY_MAX_PER_WINDOW = 25;   // ~5/s sustained — far above human cadence
+// R-175: minimum gap between two room-row requests from one socket.
+const ROOM_REQ_MIN_MS = 1500;
+
 function chattyAllowed(ws) {
   const now = Date.now();
   if (!ws.chatWinStart || now - ws.chatWinStart >= CHATTY_WINDOW_MS) {
@@ -2776,6 +2779,33 @@ wss.on('connection', async (ws, req) => {
           event: 'gps_batch',
           payload: { racers: Array.from(room.gps.values()), ts: Date.now() },
         });
+        return;
+      }
+
+      // R-175: room-row snapshot over the socket. A realme locked from GO can
+      // open no new HTTPS connection for the whole race while THIS socket, GPS
+      // and voice stay alive (rooms 783111/944942, 2026-09-06: seedHeal 22/22
+      // failed), so the client's race_rooms read never lands, the room stays a
+      // seed and R-37 rightly refuses the client finish — no fanfare, no coach
+      // line, steps NULL. Reply to the requester only, from the service-role
+      // read the relay already does elsewhere. Throttled per socket; the client
+      // asks once per heal attempt (2..30 s backoff), so a healthy race never
+      // sends this at all.
+      if (event === 'request_room') {
+        const nowReq = Date.now();
+        if (ws.lastRoomReqTs && nowReq - ws.lastRoomReqTs < ROOM_REQ_MIN_MS) return;
+        ws.lastRoomReqTs = nowReq;
+        if (!supabase) return;                       // TEST_MODE: no DB, nothing to serve
+        (async () => {
+          try {
+            const { data: r, error } = await supabase.from('race_rooms').select('*').eq('id', roomId).single();
+            if (error || !r) { log(`ROOM-REQ miss room=${roomId} user=${ws.userId} err=${error?.message || 'no row'}`); return; }
+            send(ws, { event: 'room_row', payload: { room: r, ts: nowReq } });
+            log(`ROOM-REQ room=${roomId} user=${ws.userId} status=${r.status} try=${payload.try ?? '-'}`);
+          } catch (e) {
+            log('ROOM-REQ failed', roomId, ws.userId, e?.message);
+          }
+        })();
         return;
       }
 
