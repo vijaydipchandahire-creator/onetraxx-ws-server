@@ -2486,7 +2486,11 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'not found' }));
 });
 
-const wss = new WebSocketServer({ server });
+// H-1 (08-Sep-2026): ws's default maxPayload is 100 MiB, parsed with JSON.parse on
+// the event loop. The largest legitimate frame (an Android gps_batch replay or a
+// chat message) is well under 8 KB; 64 KiB is 8x headroom. ws closes 1009 on
+// overflow, which the client treats like any other drop (reconnect + heal).
+const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 });
 
 wss.on('connection', async (ws, req) => {
   // ── Parse connection query: ?roomId=X&userId=Y&token=Z&role=racer|spectator
@@ -2730,11 +2734,13 @@ wss.on('connection', async (ws, req) => {
         // still-clamp lag that the live blend now hides).
         const dispM = st ? displayDistance(room, st, distM) : distM;
         if (st) recordReplaySample(room, st, dispM);
+        // H-4 (08-Sep-2026): speed_kmh / ts were relayed to every peer as sent;
+        // a non-numeric value reached 27 HUDs untouched.
         room.gps.set(ws.userId, {
           user_id: ws.userId,
           distance_m: dispM,
-          speed_kmh: payload.speed_kmh,
-          ts: payload.ts || Date.now(),
+          speed_kmh: Number.isFinite(payload.speed_kmh) ? payload.speed_kmh : null,
+          ts: Number.isFinite(payload.ts) && payload.ts > 0 ? payload.ts : Date.now(),
         });
         room.dirty = true;
         // First gps marks the race live and seeds the movement clock.
@@ -2864,9 +2870,13 @@ wss.on('connection', async (ws, req) => {
           return;
         }
         // Never trust a client-supplied identity on a relayed event — a racer can
-        // only quit/finish as THEMSELVES. Overwrite with the authenticated id before
-        // fan-out so a forged payload.user_id can't eject/forge a peer (H7).
-        if (event === 'racer_quit' || event === 'finished') payload.user_id = ws.userId;
+        // only quit/finish/chat/cheer as THEMSELVES. Overwrite with the authenticated
+        // id before fan-out so a forged payload.user_id can't eject/forge a peer (H7).
+        // H-2 (08-Sep-2026): extended from quit/finished to every fan-out event
+        // except race_over — receivers key their self-filter and the L-14 block
+        // filter on the relayed user_id, so a spoofed id dodged a block. Legit
+        // clients already send their own id here.
+        if (event !== 'race_over') payload.user_id = ws.userId;
         // Eviction policy: track per-racer terminal state (exempts finishers from
         // the stationary sweep) and re-check completion — the DNF/finish row this
         // event implies may be the last unresolved racer (REQ3: finishers may
@@ -3274,6 +3284,7 @@ function shutdown(signal) {
   clearInterval(presenceTimer);   // R-49
   clearInterval(pingTimer);
   clearInterval(inactivityTimer);
+  if (livekitSweepTimer) clearInterval(livekitSweepTimer);   // H-9
   for (const ws of allClients) {
     try { ws.close(1001, 'server shutting down'); } catch (e) {}
   }
