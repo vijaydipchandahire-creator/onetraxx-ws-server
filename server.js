@@ -130,6 +130,29 @@ const CHATTY_MAX_PER_WINDOW = 25;   // ~5/s sustained — far above human cadenc
 // R-175: minimum gap between two room-row requests from one socket.
 const ROOM_REQ_MIN_MS = 1500;
 
+// H-3 (08-Sep-2026): per-socket gps cadence cap. Honest clients send ~1/s and an
+// Android batch replay is ONE message, so 50 per 5 s is ten times normal; a
+// client spamming the full shadow pipeline at any cadence it likes is what this
+// stops. Beyond the cap the frame is dropped and the first drop per window is
+// logged with the count, so a real device ever coming near it shows up before
+// it hurts anyone. Bump GPS_MAX_PER_WINDOW if the log ever names a real phone.
+const GPS_WINDOW_MS = 5000;
+const GPS_MAX_PER_WINDOW = 50;
+function gpsAllowed(ws) {
+  const now = Date.now();
+  if (!ws.gpsWinStart || now - ws.gpsWinStart >= GPS_WINDOW_MS) {
+    ws.gpsWinStart = now;
+    ws.gpsCount = 0;
+    ws.gpsLimitLogged = false;
+  }
+  if (++ws.gpsCount <= GPS_MAX_PER_WINDOW) return true;
+  if (!ws.gpsLimitLogged) {
+    ws.gpsLimitLogged = true;
+    log(`GPS rate-limited user=${ws.userId} n=${ws.gpsCount} window=${GPS_WINDOW_MS}ms`);
+  }
+  return false;
+}
+
 function chattyAllowed(ws) {
   const now = Date.now();
   if (!ws.chatWinStart || now - ws.chatWinStart >= CHATTY_WINDOW_MS) {
@@ -1060,7 +1083,7 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
   const r = sh.k.step(la, ln, ac, t);
   const prevTs = sh.v2LastTs;
   sh.v2LastTs = t;
-  if (r.nis !== null && sh.nis.length < SHADOW_NIS_SAMPLE_MAX) sh.nis.push(r.nis);
+  if (r.nis !== null && sh.nis && sh.nis.length < SHADOW_NIS_SAMPLE_MAX) sh.nis.push(r.nis);
   if (sh.sx === null) {
     sh.sx = r.x; sh.sy = r.y;
     sh.win = [{ t, x: r.x, y: r.y }];
@@ -1205,7 +1228,7 @@ function shadowIngest(st, fx, activity) {
     if (!sh.firstTs) sh.firstTs = t;
     // Rounding keeps a 14400-fix worst case ~600 KB of jsonb; 6 decimals is
     // ~0.1 m, below anything the gates can resolve.
-    if (SHADOW_PERSIST_FIXES) {
+    if (SHADOW_PERSIST_FIXES && sh.fx) {
       sh.fx.push([t, +la.toFixed(6), +ln.toFixed(6),
                   Number.isFinite(ac) ? +ac.toFixed(1) : null,
                   Number.isFinite(spd) ? +spd.toFixed(2) : null]);
@@ -1260,7 +1283,7 @@ function shadowIngestSx(st, sx) {
     if (!Array.isArray(s) || s.length < 2) { sh.sxDrop++; continue; }
     const [ts, cum] = s;
     if (!Number.isFinite(ts) || !Number.isFinite(cum) || cum < 0) { sh.sxDrop++; continue; }
-    if (sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
+    if (sh.sxLog && sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
     if (!sh.sxLast) {
       // First sample anchors the first segment: snapshot the GPS accumulators
       // so the next sample can read this segment's deltas.
@@ -1601,7 +1624,7 @@ function flushShadow(roomId, room, via) {
     if (SERVER_SHADOW_V2) {
       // NIS percentiles (client census semantics): filter-health readout —
       // p50 far above 2.0 means stated accuracy under-states the true error.
-      const sorted = sh.nis.slice().sort((a, b) => a - b);
+      const sorted = (sh.nis || []).slice().sort((a, b) => a - b);
       const pct = (p) => sorted.length
         ? Math.round(sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)))] * 10) / 10
         : null;
@@ -1701,9 +1724,22 @@ function flushShadow(roomId, room, via) {
                   meta: sh.sxLog && sh.sxLog.length ? { via, sx: sh.sxLog } : { via } },
                 { onConflict: 'room_id,user_id', ignoreDuplicates: true })
         .then(({ error }) => { if (error) log('SHADOW-FIX upsert failed', roomId, userId, error.message); })
-        .catch((e) => log('SHADOW-FIX upsert error', roomId, userId, e && e.message));
+        .catch((e) => log('SHADOW-FIX upsert error', roomId, userId, e && e.message))
+        .finally(() => freeShadowArrays(sh, roomId, userId, via));
+    } else if (via === 'terminal') {
+      freeShadowArrays(sh, roomId, userId, via);
     }
   }
+}
+
+// H-10 (08-Sep-2026): after the terminal flush the per-racer fx / nis / sxLog
+// arrays (up to ~600 KB per racer) stayed until the room object died, minutes
+// after the last socket closed. Freed once the upsert promise settles; every
+// writer null-guards, and a late reader logs once instead of throwing.
+function freeShadowArrays(sh, roomId, userId, via) {
+  if (via !== 'terminal' || !sh || sh.freed) return;
+  sh.freed = true;
+  sh.fx = null; sh.nis = null; sh.sxLog = null;
 }
 
 // Canonical replay: one sample per REPLAY_STEP_MS of the racer's ACCEPTED
@@ -2243,10 +2279,17 @@ function scheduleCompletionCheck(roomId, room) {
 //
 // Returns the offending user_id, or null when the claim cannot be disproved.
 function contradictsCompletion(room) {
+  const now = Date.now();
   for (const [uid, st] of room.racers) {
-    if (!st.connected) continue;                      // gone: maybeCompleteRace's 90s window owns them
     if (st.finished || st.quit || st.evicted || st.evicting) continue;   // resolved
-    return uid;                                       // connected, racing, unresolved → not "all done"
+    if (st.connected) return uid;                     // connected, racing, unresolved → not "all done"
+    // H-7 (08-Sep-2026): a racer whose socket dropped under SERVER_GONE_GRACE_MS
+    // ago is still live by the same rule maybeCompleteRace applies (:2342). Before
+    // this, a verified race_over sent while every live racer was mid-dropout
+    // (mobile-data blip) settled the race under them. Deliberate quits and
+    // finishes are resolved above and still settle at once; only a silent
+    // disconnect gets the grace.
+    if (st.disconnectedAt && now - st.disconnectedAt < SERVER_GONE_GRACE_MS) return uid;
   }
   return null;
 }
@@ -2692,6 +2735,7 @@ wss.on('connection', async (ws, req) => {
         if (ws.role !== 'racer') return; // only racers contribute positions
         const st = room.racers.get(ws.userId);
         if (st && st.evicted) return;    // evicted racers no longer feed the room
+        if (!gpsAllowed(ws)) return;     // H-3: over-cadence frame dropped (logged once per window)
         // ── R-61: the distance the room sees is the SERVER's, not the client's ──
         // Everything downstream — the peer fanout, the eviction progress test, the
         // quit/DNF distance and the finish-time re-read — reads from here, so this
