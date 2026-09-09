@@ -495,6 +495,61 @@ const STEP_BLEND_W_BASE    = 0.40;  // steps' weight in a fully healthy segment
 const STEP_BLEND_W_MAX     = 0.90;  // ...and in a fully degraded one
 const STEP_TRIM_SHARE      = 0.25;  // blend-down ≤ this share of the base score
 const STEP_LAMBDA_WINSOR   = 0.15;  // per-sample λ pull bound once lamN ≥ 5
+// ── R-225 step FLOOR rung + steps-flat still gate (DRY-RUN by default) ──────
+// 09-Sep same-pocket races 0c7839af / bb5c8cb0 / 08bd47ff: the realme credited
+// 393/401/461 m at the moment the iPhone credited 524/528/507 — its fused
+// position PINS for 14-29 s while walking (net <5 m, Doppler ~1 m/s, +20..+51
+// steps), the still gate forfeits the pinned metres, and the acc-weighted
+// Kalman lags the noisier fixes. R-143 could not carry it: the Android hub
+// pushes an sx sample every 2 s, so segments closed at 10 s with 16-17 steps
+// (< STEP_CLEAN_MIN_STEPS) and λ never calibrated (lamN 0, fuse absent).
+// Both phones' step counts agreed within 5-12 %, and steps × 0.75-0.80 m landed
+// within a few metres of the iPhone's GPS credit.
+// This rung is a FLOOR under GPS credit: per window of ≥20 s AND ≥25 steps (or
+// 60 s regardless), add max(0, min(λ2·Δsteps, cap·T) − gpsCredit), with the
+// running total clamped so cred + starv + floor never exceeds the raw path
+// (a shaken phone with no displacement earns nothing). λ2 starts at the
+// population prior and learns ONLY from windows where GPS provably tracked the
+// walk (mean acc ≤ 6 m, cred ≥ 85 % of the raw chord, no still time) — never
+// from a device's own degraded GPS (the realme taught R-143's λ 0.56). The
+// learned λ2 is remembered per user for the relay's lifetime and re-seeded
+// from that user's latest ledger row (meta.fuse.fl) after a restart.
+// 🔑 The floor itself uses the POPULATION PRIOR, not the learned λ2, until
+// SERVER_STEP_FLOOR_LEARNED=1: replaying the 09-Sep races, even the hardened
+// clean gate let the realme teach λ2 0.61 (its 20 s windows credit 0.35-0.85
+// m/step because the pins shorten raw and cred together), and a floor built on
+// that λ2 landed at 469 m where the prior landed at 488 — a device that
+// under-credits is exactly the one whose own GPS must not set its stride. λ2
+// is therefore telemetry in this round (fl.lam2 / lam2N / src); flip the
+// learned flag only once the ledger shows lam2 tracking the healthy device.
+// Steps-flat gate: < STEP_STILL_MAX_STEPS steps over the last 20 s with a live
+// sx channel = still — the witness that survives a locked pocket (the client
+// accelerometer gate abstains there: expo-sensors stops observing onHostPause).
+// A hub that has gone SILENT (≥20 s, ≤5 min) while fixes still flow is logged
+// separately (sil) — on a still device the hub emits nothing, so silence is
+// either stillness or a dead channel; the dry run tells which.
+// Everything accumulates + logs + flushes (meta.fuse.fl / meta.fuse.ss);
+// SERVER_STEP_FLOOR=1 lets the floor SCORE (inside stepScoreM's share cap) and
+// SERVER_STEP_STILL_GATE=1 lets steps-flat SUPPRESS credit. Both default OFF.
+const SERVER_STEP_FLOOR        = process.env.SERVER_STEP_FLOOR === '1';
+const SERVER_STEP_STILL_GATE   = process.env.SERVER_STEP_STILL_GATE === '1';
+const SERVER_STEP_FLOOR_LEARNED = process.env.SERVER_STEP_FLOOR_LEARNED === '1'; // floor uses λ2, not the prior
+const STEP_FLOOR_WIN_MIN_S     = 20;    // window closes at ≥ this AND ≥ MIN_STEPS...
+const STEP_FLOOR_WIN_MIN_STEPS = 25;
+const STEP_FLOOR_WIN_FORCE_S   = 60;    // ...or at this regardless (still windows must close)
+const STEP_FLOOR_LAMBDA_PRIOR  = 0.75;  // m/step population prior (= STEP_LAMBDA_PRIOR)
+const STEP_FLOOR_CLEAN_ACC_M   = 6;     // λ2 learns only from windows with mean acc ≤ this...
+const STEP_FLOOR_CLEAN_RATIO   = 0.85;  // ...and cred ≥ this share of the raw chord
+const STEP_LAMBDA_USER_MIN_N   = 3;     // clean windows before λ2 is remembered per user
+const STEP_STILL_WINDOW_S      = 20;
+const STEP_STILL_MAX_STEPS     = 5;     // fewer steps than this over the window = still
+const STEP_STILL_SILENT_MIN_S  = 45;    // hub silent ≥ this with fixes flowing = 'sil' (iOS samples every 20 s)
+const STEP_STILL_MIN_CHANGES   = 2;     // the counter must have moved this often before 'flat' means still
+// Foot sports only: a cyclist takes no steps (35-day replay: steps-flat would have
+// zeroed every cycling race) and a bike's vibration pseudo-steps must never floor it.
+const STEP_FLOOR_ACTIVITIES    = new Set(['running', 'walking']);
+const STEP_STILL_SILENT_MAX_S  = 300;   // beyond this the channel is presumed dead: abstain
+const userLambda2 = new Map();          // user_id → { lam, n, src } — relay lifetime
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
 // still runs on the budgeted client claim. C1 = flip SERVER_AUTHORITATIVE_DISTANCE
@@ -1083,6 +1138,14 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
   const r = sh.k.step(la, ln, ac, t);
   const prevTs = sh.v2LastTs;
   sh.v2LastTs = t;
+  // R-225 steps-flat verdict for THIS fix: the ring says 'still' and the
+  // channel is fresh enough for that verdict to describe now.
+  const footSport = !sh.act || STEP_FLOOR_ACTIVITIES.has(sh.act);
+  const sxAgeMs = sh.sxLast ? t - sh.sxLast.t : Infinity;
+  const stepStillNow = footSport && sh.stepStill && sxAgeMs <= STEP_STILL_WINDOW_S * 3000;
+  const sxSilentNow = footSport && !stepStillNow && sh.sxRing.length >= 2 && sh.sxChanges >= STEP_STILL_MIN_CHANGES &&
+                      sxAgeMs >= STEP_STILL_SILENT_MIN_S * 1000 && sxAgeMs <= STEP_STILL_SILENT_MAX_S * 1000;
+  if (stepStillNow && prevTs) sh.ssMs += Math.max(0, t - prevTs);
   if (r.nis !== null && sh.nis && sh.nis.length < SHADOW_NIS_SAMPLE_MAX) sh.nis.push(r.nis);
   if (sh.sx === null) {
     sh.sx = r.x; sh.sy = r.y;
@@ -1164,6 +1227,19 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
   const fromCred = Math.hypot(r.x - sh.credAnchor.x, r.y - sh.credAnchor.y);
   if (fromCred >= floor) {
     const dtS = Math.max(0.001, (t - sh.credAnchor.t) / 1000);
+    // R-225: metres GPS would credit while the steps say the racer is still
+    // (ss) or while the hub has gone silent (sil). Dry-run counts them; the
+    // gate flag turns the steps-flat case into a still-style forfeit.
+    if (stepStillNow) {
+      sh.ssM += fromCred; sh.ssN++;
+      if (SERVER_STEP_STILL_GATE) {
+        sh.ssGateM += fromCred;
+        sh.floorM += Math.max(0, sh.pendM - fromCred);
+        sh.pendM = 0;
+        sh.credAnchor = { x: r.x, y: r.y, t };
+        return;
+      }
+    } else if (sxSilentNow) { sh.silM += fromCred; sh.silN++; }
     if (fromCred / dtS > shCapMps(sh)) sh.capM += fromCred;
     else sh.credM += fromCred;
     sh.floorM += Math.max(0, sh.pendM - fromCred);
@@ -1196,6 +1272,11 @@ function shadowIngest(st, fx, activity) {
                               sxLast: null, sxSnap: null, sxLog: [], sxDrop: 0,
                               lambda: STEP_LAMBDA_PRIOR, lamN: 0,
                               stepM: 0, stepN: 0, stepSec: 0, pinM: 0,
+                              // R-225 floor rung + steps-flat gate (dry unless flagged)
+                              fl: null, flM: 0, flN: 0, flSec: 0,
+                              lam2: STEP_FLOOR_LAMBDA_PRIOR, lam2N: 0, lam2Src: 'prior',
+                              sxRing: [], stepStill: false, sxChanges: 0, ssM: 0, ssN: 0, ssMs: 0,
+                              ssGateM: 0, silM: 0, silN: 0,
                               // R-144 blend accumulators + per-fix accuracy sums
                               accSum: 0, accN: 0, blendUpM: 0, blendDnM: 0, blendN: 0,
                               nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
@@ -1217,6 +1298,7 @@ function shadowIngest(st, fx, activity) {
   // R-165: per-activity caps; room meta hydrates on the first frame, so an
   // early frame with no activity runs at the foot caps and upgrades next frame.
   sh.capMps  = SHADOW_CREDIT_CAP_MPS_BY_ACT[activity] || SHADOW_MAX_CREDIT_MPS;
+  sh.act     = activity || sh.act || null;   // R-225: foot-sport gate reads this
   sh.teleMps = SHADOW_TELEPORT_MPS_BY_ACT[activity]   || SHADOW_TELEPORT_MPS;
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
@@ -1276,13 +1358,16 @@ function shadowIngest(st, fx, activity) {
 // about. Runs only when a shadow accumulator already exists: step credit is
 // meaningless without a GPS stream to calibrate against (and the release gate
 // below requires one anyway).
-function shadowIngestSx(st, sx) {
+function shadowIngestSx(st, sx, userId) {
   const sh = st.shadow;
   if (!sh) return;
+  if (userId) shadowSeedLambda2(sh, userId);
   for (const s of sx) {
     if (!Array.isArray(s) || s.length < 2) { sh.sxDrop++; continue; }
     const [ts, cum] = s;
     if (!Number.isFinite(ts) || !Number.isFinite(cum) || cum < 0) { sh.sxDrop++; continue; }
+    // R-225: independent window bookkeeping — never touches the R-143 segments.
+    shadowStepFloorSample(sh, ts, cum, userId);
     if (sh.sxLog && sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
     if (!sh.sxLast) {
       // First sample anchors the first segment: snapshot the GPS accumulators
@@ -1308,6 +1393,118 @@ function shadowIngestSx(st, sx) {
     sh.sxLast = { t: ts, c: cum };
     sh.sxSnap = shadowSxSnap(sh);
   }
+}
+
+// ── R-225: per-user λ2 memory ────────────────────────────────────────────────
+// Seeds a fresh accumulator from what this user's steps have already taught us
+// (relay lifetime map; after a restart, the user's latest ledger row that
+// carries a calibrated fl.lam2). Fire-and-forget; a late answer only lands
+// while this race has not calibrated on its own.
+const lambda2Loading = new Set();
+function shadowSeedLambda2(sh, userId) {
+  if (sh.lam2Seeded) return;
+  sh.lam2Seeded = true;
+  const known = userLambda2.get(userId);
+  if (known && known.n >= STEP_LAMBDA_USER_MIN_N) {
+    if (sh.lam2N === 0) { sh.lam2 = known.lam; sh.lam2Src = 'user'; }
+    return;
+  }
+  if (!supabase || lambda2Loading.has(userId)) return;
+  lambda2Loading.add(userId);
+  supabase.from('race_shadow_distance').select('meta').eq('user_id', userId)
+    .order('created_at', { ascending: false }).limit(8)
+    .then(({ data, error }) => {
+      lambda2Loading.delete(userId);
+      if (error || !Array.isArray(data)) return;
+      for (const row of data) {
+        const fl = row && row.meta && row.meta.fuse && row.meta.fuse.fl;
+        if (fl && Number.isFinite(fl.lam2) && (fl.lam2N || 0) >= STEP_LAMBDA_USER_MIN_N &&
+            fl.lam2 >= STEP_LAMBDA_MIN && fl.lam2 <= STEP_LAMBDA_MAX) {
+          if (!userLambda2.has(userId)) userLambda2.set(userId, { lam: fl.lam2, n: fl.lam2N, src: 'ledger' });
+          if (sh.lam2N === 0) { sh.lam2 = fl.lam2; sh.lam2Src = 'user'; }
+          break;
+        }
+      }
+    })
+    .catch(() => { lambda2Loading.delete(userId); });
+}
+
+// One accepted sx sample through the R-225 bookkeeping: steps-flat ring, then
+// the floor window (closes at ≥20 s AND ≥25 steps, or 60 s regardless).
+function shadowStepFloorSample(sh, ts, cum, userId) {
+  if (sh.act && !STEP_FLOOR_ACTIVITIES.has(sh.act)) return;   // bikes/swims: no steps to read
+  const ring = sh.sxRing;
+  const last = ring.length ? ring[ring.length - 1] : null;
+  if (last && (ts <= last[0] || cum < last[1])) {
+    // Backwards clock or counter (hub reset): void the ring and the open window.
+    ring.length = 0; sh.stepStill = false; sh.fl = null;
+  }
+  if (last && cum > last[1]) sh.sxChanges++;   // a dead channel repeats one value forever
+  ring.push([ts, cum]);
+  const winMs = STEP_STILL_WINDOW_S * 1000;
+  while (ring.length > 2 && ring[1][0] <= ts - winMs) ring.shift();
+  const ref = ring[0];
+  // 'Flat' only means 'still' once the counter has proven it moves (35-day replay:
+  // a realme whose hub reported 1 step all race ran 737 m — a dead channel, not a parked racer).
+  if (ref && ref[0] <= ts - winMs) {
+    sh.stepStill = sh.sxChanges >= STEP_STILL_MIN_CHANGES && (cum - ref[1]) < STEP_STILL_MAX_STEPS;
+  }
+  // else: no sample old enough yet — verdict unchanged (abstain on absence)
+
+  if (!sh.fl) { sh.fl = { t: ts, c: cum, rawM: sh.rawM, snap: shadowSxSnap(sh) }; return; }
+  const dS = cum - sh.fl.c;
+  const T = (ts - sh.fl.t) / 1000;
+  if (dS < 0 || T <= 0) { sh.fl = { t: ts, c: cum, rawM: sh.rawM, snap: shadowSxSnap(sh) }; return; }
+  const close = (T >= STEP_FLOOR_WIN_MIN_S && dS >= STEP_FLOOR_WIN_MIN_STEPS) || T >= STEP_FLOOR_WIN_FORCE_S;
+  if (!close) return;
+  if (T <= STEP_SEG_MAX_S) shadowStepFloorWindow(sh, dS, T, sh.fl, userId);
+  sh.fl = { t: ts, c: cum, rawM: sh.rawM, snap: shadowSxSnap(sh) };
+}
+
+// Close one floor window: calibrate λ2 if GPS provably tracked the walk, then
+// bank the step floor the GPS credit fell short of. Every branch is bounded.
+function shadowStepFloorWindow(sh, dS, T, w, userId) {
+  const cadence = dS / T;
+  if (cadence > STEP_CADENCE_MAX_SPS) return;             // shaking, not walking
+  const snap = w.snap;
+  const credDelta  = Math.max(0, sh.credM - snap.credM);
+  const starvDelta = Math.max(0, sh.starvM - snap.starvM);
+  const rawDelta   = Math.max(0, sh.rawM - w.rawM);
+  const stillS     = Math.max(0, (sh.stillMs - snap.stillMs) / 1000);
+  const fixHz      = Math.max(0, sh.n - snap.n) / T;
+  const accSpan    = sh.accN - snap.accN;
+  const accMean    = accSpan > 0 ? (sh.accSum - snap.accSum) / accSpan : 10;
+  const clean = fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_FLOOR_WIN_MIN_STEPS &&
+                credDelta > 0 && rawDelta > 0 &&
+                credDelta >= STEP_FLOOR_CLEAN_RATIO * rawDelta && accMean <= STEP_FLOOR_CLEAN_ACC_M;
+  if (clean) {
+    let ratio = credDelta / dS;
+    if (ratio >= STEP_LAMBDA_MIN && ratio <= STEP_LAMBDA_MAX) {
+      if (sh.lam2N >= 5) {
+        ratio = Math.min(sh.lam2 * (1 + STEP_LAMBDA_WINSOR),
+                Math.max(sh.lam2 * (1 - STEP_LAMBDA_WINSOR), ratio));
+      }
+      sh.lam2 = sh.lam2N === 0 ? ratio : sh.lam2 + STEP_LAMBDA_ALPHA * (ratio - sh.lam2);
+      sh.lam2N++;
+      sh.lam2Src = 'race';
+      if (userId && sh.lam2N >= STEP_LAMBDA_USER_MIN_N) {
+        userLambda2.set(userId, { lam: sh.lam2, n: sh.lam2N, src: 'race' });
+      }
+    }
+  }
+  if (dS < STEP_MOVE_MIN_STEPS) return;                    // not demonstrably stepping
+  const lam = SERVER_STEP_FLOOR_LEARNED
+    ? Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lam2))
+    : STEP_FLOOR_LAMBDA_PRIOR;
+  const est = Math.min(lam * dS, T * shCapMps(sh));
+  const gps = credDelta + starvDelta;
+  let add = Math.max(0, est - gps);
+  // Ceiling: the running total may never lift the score above the raw path.
+  add = Math.min(add, Math.max(0, sh.rawM - sh.credM - sh.starvM - sh.flM));
+  if (add <= 0.5) return;
+  sh.flM += add;
+  sh.flN++;
+  sh.flSec += Math.round(T);
 }
 
 // GPS-accumulator snapshot at a segment boundary — the next boundary diffs it.
@@ -1432,6 +1629,11 @@ function stepScoreM(sh) {
     // blendUp shares the step rung's cap — one pool of "metres steps added".
     const pos = sh.stepM + (SERVER_STEP_BLEND ? sh.blendUpM : 0);
     if (pos > 0) add += Math.min(pos, base * share / (1 - share));
+  }
+  if (SERVER_STEP_FLOOR && sh.flM > 0) {
+    // R-225 floor rung — its own bounds (per-window clamp, raw-path ceiling)
+    // plus the same share cap. Dry-run (default) contributes exactly 0.
+    add += Math.min(sh.flM, base * share / (1 - share));
   }
   if (SERVER_STEP_BLEND && sh.blendDnM > 0) {
     add -= Math.min(sh.blendDnM, base * STEP_TRIM_SHARE);
@@ -1655,7 +1857,7 @@ function flushShadow(roomId, room, via) {
       // and whether it SCORED. The dry-run go/no-go reads: on a pocket race the
       // degraded device's cred + starv + fuse.m ≈ the healthy device's credit;
       // on healthy/parked/shake races fuse.m ≈ 0 (absent = no segments banked).
-      if (sh.stepN || sh.lamN || sh.sxDrop || sh.blendN) {
+      if (sh.stepN || sh.lamN || sh.sxDrop || sh.blendN || sh.flN || sh.lam2N || sh.ssN || sh.silN) {
         meta.fuse = { m: Math.round(sh.stepM), n: sh.stepN, sec: sh.stepSec,
                       pinM: Math.round(sh.pinM), lam: Math.round(sh.lambda * 100) / 100,
                       lamN: sh.lamN, drop: sh.sxDrop, live: SERVER_STEP_FUSION,
@@ -1664,7 +1866,20 @@ function flushShadow(roomId, room, via) {
                       // the laggard's winner-cross deficit; both ≈0 on a device
                       // whose GPS matched its steps all race.
                       up: Math.round(sh.blendUpM), dn: Math.round(sh.blendDnM),
-                      bn: sh.blendN, blive: SERVER_STEP_BLEND };
+                      bn: sh.blendN, blive: SERVER_STEP_BLEND,
+                      // R-225 floor rung: metres/windows/seconds banked, λ2 and
+                      // its clean-window count + source, and whether it SCORED.
+                      fl: { m: Math.round(sh.flM), n: sh.flN, sec: sh.flSec,
+                            lam2: Math.round(sh.lam2 * 100) / 100, lam2N: sh.lam2N,
+                            src: sh.lam2Src, live: SERVER_STEP_FLOOR,
+                            learned: SERVER_STEP_FLOOR_LEARNED },
+                      // R-225 steps-flat: metres GPS credited while steps said
+                      // still (m/n/sec), metres actually forfeited by the gate
+                      // (gateM), metres credited while the hub was silent (silM).
+                      ss: { m: Math.round(sh.ssM), n: sh.ssN, sec: Math.round(sh.ssMs / 1000),
+                            gateM: Math.round(sh.ssGateM), silM: Math.round(sh.silM), silN: sh.silN,
+                            chg: sh.sxChanges,
+                            live: SERVER_STEP_STILL_GATE } };
       }
       if (sh.finSnap && sh.finSnap.stepM) meta.finStepM = Math.round(sh.finSnap.stepM);
       // cred≤raw is a published invariant (register R-100 col 15). The CV
@@ -1709,7 +1924,9 @@ function flushShadow(roomId, room, via) {
           ? ` v2 smooth=${meta.smoothRawM} still=${meta.stillM} floor=${meta.floorM} cap=${meta.capM} stillSec=${meta.stillSec} fin=${meta.finM != null ? meta.finM : '-'}` +
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
             (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
-                         ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` : '')
+                         ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
+                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
+                         ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
@@ -2764,7 +2981,7 @@ wss.on('connection', async (ws, req) => {
         // so a segment closing on this frame sees this frame's fixes; the sx
         // cap (40/msg client-side, resliced here) bounds the loop like fx's.
         if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.sx) && payload.sx.length) {
-          shadowIngestSx(st, payload.sx.slice(0, 60));
+          shadowIngestSx(st, payload.sx.slice(0, 60), ws.userId);
         }
         if (SERVER_DISTANCE_BUDGET) void ensureBudgetMeta(roomId, room);
         const distM = st ? authoritativeDistance(roomId, room, st, ws.userId, payload.distance_m, nowTs)
