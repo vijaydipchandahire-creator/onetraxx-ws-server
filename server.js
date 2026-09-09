@@ -534,6 +534,18 @@ const STEP_LAMBDA_WINSOR   = 0.15;  // per-sample λ pull bound once lamN ≥ 5
 const SERVER_STEP_FLOOR        = process.env.SERVER_STEP_FLOOR === '1';
 const SERVER_STEP_STILL_GATE   = process.env.SERVER_STEP_STILL_GATE === '1';
 const SERVER_STEP_FLOOR_LEARNED = process.env.SERVER_STEP_FLOOR_LEARNED === '1'; // floor uses λ2, not the prior
+// R-225b (09-Sep dry-run read): the per-WINDOW floor banks only the positive
+// part of each 20 s window, so GPS jitter ratchets upward even on a phone that
+// tracks the walk — the iPhone banked 30-38 m (6-7 % of a 510 m race) on two
+// clean races. The CUMULATIVE variant keeps one running deficit instead:
+// max(0, Σ min(λ·Δsteps, cap·T) − Σ gpsCredit) over the same qualifying
+// windows, under the same raw-path ceiling. A window where GPS out-credited
+// the steps now pays the deficit DOWN. Replay estimate on the 09-Sep pocket
+// races: iPhone 0 / 8 m, realme 209 / 34 m. Both totals are logged and
+// flushed (fl.m = window, fl.cumM = cumulative); which one SCORES when
+// SERVER_STEP_FLOOR=1 is chosen by SERVER_STEP_FLOOR_MODE ('win' default,
+// 'cum'). Dry-run either way until the floor flag is set.
+const SERVER_STEP_FLOOR_MODE   = process.env.SERVER_STEP_FLOOR_MODE === 'cum' ? 'cum' : 'win';
 const STEP_FLOOR_WIN_MIN_S     = 20;    // window closes at ≥ this AND ≥ MIN_STEPS...
 const STEP_FLOOR_WIN_MIN_STEPS = 25;
 const STEP_FLOOR_WIN_FORCE_S   = 60;    // ...or at this regardless (still windows must close)
@@ -1273,7 +1285,7 @@ function shadowIngest(st, fx, activity) {
                               lambda: STEP_LAMBDA_PRIOR, lamN: 0,
                               stepM: 0, stepN: 0, stepSec: 0, pinM: 0,
                               // R-225 floor rung + steps-flat gate (dry unless flagged)
-                              fl: null, flM: 0, flN: 0, flSec: 0,
+                              fl: null, flM: 0, flN: 0, flSec: 0, flEstM: 0, flGpsM: 0,
                               lam2: STEP_FLOOR_LAMBDA_PRIOR, lam2N: 0, lam2Src: 'prior',
                               sxRing: [], stepStill: false, sxChanges: 0, ssM: 0, ssN: 0, ssMs: 0,
                               ssGateM: 0, silM: 0, silN: 0,
@@ -1498,6 +1510,10 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
     : STEP_FLOOR_LAMBDA_PRIOR;
   const est = Math.min(lam * dS, T * shCapMps(sh));
   const gps = credDelta + starvDelta;
+  // R-225b cumulative variant: the same qualifying windows feed one running
+  // deficit; shadowFloorCumM() clamps it at read time.
+  sh.flEstM += est;
+  sh.flGpsM += gps;
   let add = Math.max(0, est - gps);
   // Ceiling: the running total may never lift the score above the raw path.
   add = Math.min(add, Math.max(0, sh.rawM - sh.credM - sh.starvM - sh.flM));
@@ -1505,6 +1521,17 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
   sh.flM += add;
   sh.flN++;
   sh.flSec += Math.round(T);
+}
+
+// R-225b: cumulative floor = running step-estimate deficit over GPS credit,
+// never above the raw path (the same ceiling the window variant uses).
+function shadowFloorCumM(sh) {
+  const deficit = Math.max(0, sh.flEstM - sh.flGpsM);
+  return Math.min(deficit, Math.max(0, sh.rawM - sh.credM - sh.starvM));
+}
+// Which floor total scores under SERVER_STEP_FLOOR=1 (dry-run reads both).
+function shadowFloorScoreM(sh) {
+  return SERVER_STEP_FLOOR_MODE === 'cum' ? shadowFloorCumM(sh) : sh.flM;
 }
 
 // GPS-accumulator snapshot at a segment boundary — the next boundary diffs it.
@@ -1630,10 +1657,12 @@ function stepScoreM(sh) {
     const pos = sh.stepM + (SERVER_STEP_BLEND ? sh.blendUpM : 0);
     if (pos > 0) add += Math.min(pos, base * share / (1 - share));
   }
-  if (SERVER_STEP_FLOOR && sh.flM > 0) {
-    // R-225 floor rung — its own bounds (per-window clamp, raw-path ceiling)
-    // plus the same share cap. Dry-run (default) contributes exactly 0.
-    add += Math.min(sh.flM, base * share / (1 - share));
+  if (SERVER_STEP_FLOOR) {
+    // R-225 floor rung — its own bounds (per-window clamp or cumulative
+    // deficit per SERVER_STEP_FLOOR_MODE, raw-path ceiling) plus the same
+    // share cap. Dry-run (default) contributes exactly 0.
+    const flScore = shadowFloorScoreM(sh);
+    if (flScore > 0) add += Math.min(flScore, base * share / (1 - share));
   }
   if (SERVER_STEP_BLEND && sh.blendDnM > 0) {
     add -= Math.min(sh.blendDnM, base * STEP_TRIM_SHARE);
@@ -1870,6 +1899,11 @@ function flushShadow(roomId, room, via) {
                       // R-225 floor rung: metres/windows/seconds banked, λ2 and
                       // its clean-window count + source, and whether it SCORED.
                       fl: { m: Math.round(sh.flM), n: sh.flN, sec: sh.flSec,
+                            // R-225b: cumulative-deficit total + its raw sums, and
+                            // which variant would score under the floor flag.
+                            cumM: Math.round(shadowFloorCumM(sh)),
+                            estM: Math.round(sh.flEstM), gpsM: Math.round(sh.flGpsM),
+                            mode: SERVER_STEP_FLOOR_MODE,
                             lam2: Math.round(sh.lam2 * 100) / 100, lam2N: sh.lam2N,
                             src: sh.lam2Src, live: SERVER_STEP_FLOOR,
                             learned: SERVER_STEP_FLOOR_LEARNED },
@@ -1925,7 +1959,7 @@ function flushShadow(roomId, room, via) {
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
             (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
-                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
+                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
                          ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
