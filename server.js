@@ -580,6 +580,22 @@ const STEP_FLOOR_CEIL_K = (() => {
   return Number.isFinite(v) && v > 1 && v <= 1.5 ? v : 1;
 })();
 const STEP_FLOOR_CEIL_STILL_S  = 20;    // still seconds this race before the K ceiling applies
+// R-231 (10-Sep, Step B of the permanent plan): a stride the relay can trust
+// that does NOT come from a degraded device's own GPS. users.height_cm (set in
+// Profile) → walking stride ≈ STEP_STRIDE_HEIGHT_K × height (Hof/textbook 0.41-
+// 0.42; 170 cm ⇒ 0.70 m). Replaces the 0.75 m population prior in the floor's
+// estimate for WALKING-cadence windows only (≤ STEP_STRIDE_WALK_MAX_SPS): a
+// running stride grows with pace and one constant cannot follow it, so running
+// windows keep the existing prior/λ2 path. Same-person stride still varies
+// ±5 % with pace race to race — this trims the prior's bias, not that noise.
+// Loaded once per accumulator (service-role read, fire-and-forget, cached per
+// user for the relay's lifetime); absent height ⇒ exactly today's behaviour.
+// SERVER_STEP_FLOOR_USER_STRIDE=1 lets it SCORE; unset = telemetry only
+// (meta.fuse.fl.us carries the stride either way).
+const SERVER_STEP_FLOOR_USER_STRIDE = process.env.SERVER_STEP_FLOOR_USER_STRIDE === '1';
+const STEP_STRIDE_HEIGHT_K     = 0.414;
+const STEP_STRIDE_WALK_MAX_SPS = 2.0;   // cadence above this = running: user stride abstains
+const userStride = new Map();           // user_id → m/step | null (null = looked up, no height)
 const STEP_FLOOR_WIN_MIN_S     = 20;    // window closes at ≥ this AND ≥ MIN_STEPS...
 const STEP_FLOOR_WIN_MIN_STEPS = 25;
 const STEP_FLOOR_WIN_FORCE_S   = 60;    // ...or at this regardless (still windows must close)
@@ -1407,7 +1423,7 @@ function shadowIngest(st, fx, activity) {
 function shadowIngestSx(st, sx, userId) {
   const sh = st.shadow;
   if (!sh) return;
-  if (userId) shadowSeedLambda2(sh, userId);
+  if (userId) { shadowSeedLambda2(sh, userId); shadowSeedStride(sh, userId); }
   for (const s of sx) {
     if (!Array.isArray(s) || s.length < 2) { sh.sxDrop++; continue; }
     const [ts, cum] = s;
@@ -1475,6 +1491,27 @@ function shadowSeedLambda2(sh, userId) {
     .catch(() => { lambda2Loading.delete(userId); });
 }
 
+// R-231: per-user stride from Profile height (see the constants block).
+const strideLoading = new Set();
+function shadowSeedStride(sh, userId) {
+  if (sh.strideSeeded) return;
+  sh.strideSeeded = true;
+  if (userStride.has(userId)) { sh.strideUser = userStride.get(userId); return; }
+  if (!supabase || strideLoading.has(userId)) return;
+  strideLoading.add(userId);
+  supabase.from('users').select('height_cm').eq('id', userId).maybeSingle()
+    .then(({ data, error }) => {
+      strideLoading.delete(userId);
+      if (error) return;
+      const h = data && Number(data.height_cm);
+      const stride = Number.isFinite(h) && h >= 100 && h <= 250
+        ? Math.round(STEP_STRIDE_HEIGHT_K * h) / 100 : null;
+      userStride.set(userId, stride);
+      sh.strideUser = stride;
+    })
+    .catch(() => { strideLoading.delete(userId); });
+}
+
 // One accepted sx sample through the R-225 bookkeeping: steps-flat ring, then
 // the floor window (closes at ≥20 s AND ≥25 steps, or 60 s regardless).
 function shadowStepFloorSample(sh, ts, cum, userId) {
@@ -1539,9 +1576,14 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
     }
   }
   if (dS < STEP_MOVE_MIN_STEPS) return;                    // not demonstrably stepping
-  const lam = SERVER_STEP_FLOOR_LEARNED
-    ? Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lam2))
-    : STEP_FLOOR_LAMBDA_PRIOR;
+  // R-231: Profile-height stride on walking-cadence windows, when flagged.
+  const userLam = (SERVER_STEP_FLOOR_USER_STRIDE && sh.strideUser > 0 && cadence <= STEP_STRIDE_WALK_MAX_SPS)
+    ? sh.strideUser : null;
+  const lam = userLam != null ? userLam
+    : SERVER_STEP_FLOOR_LEARNED
+      ? Math.min(STEP_LAMBDA_MAX, Math.max(STEP_LAMBDA_MIN, sh.lam2))
+      : STEP_FLOOR_LAMBDA_PRIOR;
+  if (userLam != null) sh.flUserN = (sh.flUserN || 0) + 1;
   const est = Math.min(lam * dS, T * shCapMps(sh));
   const gps = credDelta + starvDelta;
   // R-225b cumulative variant: the same qualifying windows feed one running
@@ -1954,7 +1996,11 @@ function flushShadow(roomId, room, via) {
                             learned: SERVER_STEP_FLOOR_LEARNED,
                             // R-230: share cap the floor scored under and the
                             // raw-path ceiling factor in effect at flush.
-                            shr: shadowFloorShare(sh), ck: shadowFloorCeilK(sh) },
+                            shr: shadowFloorShare(sh), ck: shadowFloorCeilK(sh),
+                            // R-231: Profile-height stride (m/step, null = no height),
+                            // windows it drove, and whether it SCORED.
+                            us: sh.strideUser == null ? null : sh.strideUser,
+                            usN: sh.flUserN || 0, uslive: SERVER_STEP_FLOOR_USER_STRIDE },
                       // R-225 steps-flat: metres GPS credited while steps said
                       // still (m/n/sec), metres actually forfeited by the gate
                       // (gateM), metres credited while the hub was silent (silM).
@@ -2007,7 +2053,7 @@ function flushShadow(roomId, room, via) {
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
             (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
-                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
+                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} us=${meta.fuse.fl.us}/${meta.fuse.fl.usN}(${meta.fuse.fl.uslive ? 'live' : 'dry'}) lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
                          ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
