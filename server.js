@@ -546,6 +546,40 @@ const SERVER_STEP_FLOOR_LEARNED = process.env.SERVER_STEP_FLOOR_LEARNED === '1';
 // SERVER_STEP_FLOOR=1 is chosen by SERVER_STEP_FLOOR_MODE ('win' default,
 // 'cum'). Dry-run either way until the floor flag is set.
 const SERVER_STEP_FLOOR_MODE   = process.env.SERVER_STEP_FLOOR_MODE === 'cum' ? 'cum' : 'win';
+// R-230 (10-Sep, first three races after the cum-floor flip): the floor was
+// LIVE and still left the realme 102 s behind the same-pocket iPhone, and at
+// 222 m vs 444 m after a 4-min standstill. Two ceilings bound it, in order:
+//  (1) stepScoreM's share cap. It releases from STEP_SHARE_UNCAL (0.30) to
+//      STEP_SHARE_MAX only on R-143's lamN, which never calibrates on the
+//      realme (2 s hub samples → 10 s segments < 25 steps). So every realme
+//      race was capped at 0.43 × GPS credit whatever the steps said (race
+//      2d6d0043: 155 + 66 = 221 = the AUTH-DELTA exactly). The floor has its
+//      own calibration witness — λ2 learned from ≥20 s windows with clean GPS
+//      (lam2N 3-9 on the realme today, 0.71-0.77 ≈ the prior). Under
+//      SERVER_STEP_FLOOR_SHARE_LAM2=1 the floor's share releases on lam2N too.
+//  (2) The raw-path ceiling (floor ≤ raw − cred − starv). Releasing (1) alone
+//      leaves the score pinned to rawM every minute: the realme's fused
+//      position freezes for 15-30 s at a time while its owner walks, the
+//      catch-up jump is then dropped as a teleport, and rawM itself runs
+//      15-20 % short of the walk (398 m at 360 s where the iPhone credited
+//      480). Steps × 0.75 tracked the iPhone within a few %. Under
+//      SERVER_STEP_FLOOR_CEIL_K (1 < K ≤ 1.5) the cumulative floor may lift
+//      the score to K × rawM — but ONLY once the device has logged
+//      ≥ STEP_FLOOR_CEIL_STILL_S of still time this race, the signature of the
+//      pin (a healthy phone that never pins keeps the strict ceiling, so its
+//      step-estimate noise cannot ratchet: iPhone race 98409842 stays at
+//      cum 0 / 419 s instead of 25 m / 391 s under an ungated K). A shaken
+//      parked phone has rawM ≈ 0, so K × 0 still earns nothing; a walked-then-
+//      shaken phone can inflate a REAL walk by at most K − 1.
+// Replay (scratch rig, 3 races 10-Sep, K=1.15, still 20 s): realme crosses at
+// 406 s vs the iPhone's 381 (was 478); standstill race 388 vs 440 (was 222);
+// iPhone rows byte-identical. Both flags unset ⇒ scoring byte-identical.
+const SERVER_STEP_FLOOR_SHARE_LAM2 = process.env.SERVER_STEP_FLOOR_SHARE_LAM2 === '1';
+const STEP_FLOOR_CEIL_K = (() => {
+  const v = Number(process.env.SERVER_STEP_FLOOR_CEIL_K);
+  return Number.isFinite(v) && v > 1 && v <= 1.5 ? v : 1;
+})();
+const STEP_FLOOR_CEIL_STILL_S  = 20;    // still seconds this race before the K ceiling applies
 const STEP_FLOOR_WIN_MIN_S     = 20;    // window closes at ≥ this AND ≥ MIN_STEPS...
 const STEP_FLOOR_WIN_MIN_STEPS = 25;
 const STEP_FLOOR_WIN_FORCE_S   = 60;    // ...or at this regardless (still windows must close)
@@ -1527,7 +1561,17 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
 // never above the raw path (the same ceiling the window variant uses).
 function shadowFloorCumM(sh) {
   const deficit = Math.max(0, sh.flEstM - sh.flGpsM);
-  return Math.min(deficit, Math.max(0, sh.rawM - sh.credM - sh.starvM));
+  return Math.min(deficit, Math.max(0, sh.rawM * shadowFloorCeilK(sh) - sh.credM - sh.starvM));
+}
+// R-230: raw-path ceiling factor in effect for this racer (1 = strict).
+function shadowFloorCeilK(sh) {
+  return (STEP_FLOOR_CEIL_K > 1 && sh.stillMs >= STEP_FLOOR_CEIL_STILL_S * 1000) ? STEP_FLOOR_CEIL_K : 1;
+}
+// R-230: the floor's share cap releases on its own λ2 witness when flagged.
+function shadowFloorShare(sh) {
+  const cal = sh.lamN >= STEP_CLEAN_FOR_CAL ||
+              (SERVER_STEP_FLOOR_SHARE_LAM2 && sh.lam2N >= STEP_CLEAN_FOR_CAL);
+  return cal ? STEP_SHARE_MAX : STEP_SHARE_UNCAL;
 }
 // Which floor total scores under SERVER_STEP_FLOOR=1 (dry-run reads both).
 function shadowFloorScoreM(sh) {
@@ -1662,7 +1706,8 @@ function stepScoreM(sh) {
     // deficit per SERVER_STEP_FLOOR_MODE, raw-path ceiling) plus the same
     // share cap. Dry-run (default) contributes exactly 0.
     const flScore = shadowFloorScoreM(sh);
-    if (flScore > 0) add += Math.min(flScore, base * share / (1 - share));
+    const flShare = shadowFloorShare(sh);   // R-230: == share unless SHARE_LAM2 releases it
+    if (flScore > 0) add += Math.min(flScore, base * flShare / (1 - flShare));
   }
   if (SERVER_STEP_BLEND && sh.blendDnM > 0) {
     add -= Math.min(sh.blendDnM, base * STEP_TRIM_SHARE);
@@ -1906,7 +1951,10 @@ function flushShadow(roomId, room, via) {
                             mode: SERVER_STEP_FLOOR_MODE,
                             lam2: Math.round(sh.lam2 * 100) / 100, lam2N: sh.lam2N,
                             src: sh.lam2Src, live: SERVER_STEP_FLOOR,
-                            learned: SERVER_STEP_FLOOR_LEARNED },
+                            learned: SERVER_STEP_FLOOR_LEARNED,
+                            // R-230: share cap the floor scored under and the
+                            // raw-path ceiling factor in effect at flush.
+                            shr: shadowFloorShare(sh), ck: shadowFloorCeilK(sh) },
                       // R-225 steps-flat: metres GPS credited while steps said
                       // still (m/n/sec), metres actually forfeited by the gate
                       // (gateM), metres credited while the hub was silent (silM).
@@ -1959,7 +2007,7 @@ function flushShadow(roomId, room, via) {
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
             (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
-                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
+                         ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
                          ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
