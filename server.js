@@ -114,6 +114,7 @@ const MAX_SPECTATORS = 20;
 const CLOSE_BAD_REQUEST = 4000; // missing/invalid query params, or replaced
 const CLOSE_AUTH_FAILED = 4001; // token invalid, expired, or user mismatch
 const CLOSE_ROOM_FULL   = 4002; // racer or spectator cap reached
+const CLOSE_NOT_MEMBER  = 4003; // R-250: no room_members row (or kicked) for this room
 
 // Events relayed immediately to everyone else in the room (sender excluded).
 const FANOUT_EVENTS = new Set([
@@ -594,8 +595,10 @@ const STEP_FLOOR_CEIL_STILL_S  = 20;    // still seconds this race before the K 
 // (meta.fuse.fl.us carries the stride either way).
 const SERVER_STEP_FLOOR_USER_STRIDE = process.env.SERVER_STEP_FLOOR_USER_STRIDE === '1';
 const STEP_STRIDE_HEIGHT_K     = 0.414;
-const STEP_STRIDE_WALK_MAX_SPS = 2.0;   // cadence above this = running: user stride abstains
-const userStride = new Map();           // user_id → m/step | null (null = looked up, no height)
+// R-266: 2.0 sps excluded brisk walking (owner pocket races run 2.0-2.3 sps); the bound
+// only gates the USER-stride path (flag on) — the running prior/λ2 branch is untouched.
+const STEP_STRIDE_WALK_MAX_SPS = 2.4;   // cadence above this = running: user stride abstains
+const userStride = new Map();           // user_id → m/step | null (null = looked up, no height); last known, refreshed at every JOIN
 const STEP_FLOOR_WIN_MIN_S     = 20;    // window closes at ≥ this AND ≥ MIN_STEPS...
 const STEP_FLOOR_WIN_MIN_STEPS = 25;
 const STEP_FLOOR_WIN_FORCE_S   = 60;    // ...or at this regardless (still windows must close)
@@ -611,6 +614,45 @@ const STEP_STILL_MIN_CHANGES   = 2;     // the counter must have moved this ofte
 // zeroed every cycling race) and a bike's vibration pseudo-steps must never floor it.
 const STEP_FLOOR_ACTIVITIES    = new Set(['running', 'walking']);
 const STEP_STILL_SILENT_MAX_S  = 300;   // beyond this the channel is presumed dead: abstain
+// ── R-310 step-segment COVERAGE guard (DRY-RUN by default) ──────────────────
+// 12-Sep room 36e77878 (iPhone, 3-min phone call): the client queues fx and sx
+// while the socket is down and replays them on reconnect — 120 fx + 9 sx on
+// ONE message, fx ingested first. shadowIngestSx then closed nine segments in
+// a row against accumulators that already held the whole burst: the first
+// read 3 min of credit for 21 s of steps (ratio out of band, blend trim), the
+// next eight read fixHz 0 → 'starved' → λ·ΔS banked ON TOP of credit already
+// in credM (+182 m one second after JOIN; 690 credited on a 488 m raw path).
+// Android has the same shape every 20 s with no outage: the hub drain lands
+// ~10 sx (2 s apart) one message AFTER the fixes for the same span, so each
+// batch's first segment reads ~20 s of GPS and its second reads none — realme
+// e7551b10 (02-Sep) banked 172 m over 'starved' segments while 0 of 32 were
+// starved by timestamp (protected today only because λ never calibrates on
+// hub cadence: lamN 0).
+// Root: the snapshot diff is indexed by INGEST order, the segment by
+// TIMESTAMP. The guard checks that the two agree — the newest DELIVERED fix
+// ts (sh.seenTs: accepted or acc-dropped) at anchor time (snap.coverTs) sat
+// near segStart and sits near segEnd now — before a segment may calibrate λ,
+// carry, or blend:
+//   spent — snap.coverTs ≥ segEnd − slack: the stream had already passed this
+//           span when its anchor was taken; the diff holds none of its GPS.
+//   over  — sh.seenTs > segEnd + slack: the diff holds GPS from after the span.
+//   overL — a DENSE diff (≥ STEP_CLEAN_MIN_FIXHZ, i.e. one that could teach λ)
+//           whose anchor sat > slack before segStart: the diff holds GPS from
+//           before the span (a replay tail landing one message late). A sparse
+//           diff reaching back (1 fix/min: the gap-closing fix) is left alone —
+//           its chord is already subtracted by the carry's gps term.
+//   burst — a full-cap fx message (client queue ≥ 120) just landed and this
+//           span saw none of it: its fixes are on the next message.
+// A genuinely starved span (LG saver, 1 fix/min) or a pinned position with
+// fixes flowing has the stream BEHIND or AT both ends: no test fires and
+// R-143 carries exactly as today. Flag unset = telemetry only (STEP-COVER-DRY
+// lines, meta.fuse.cv, AUTH-DELTA cover=): scoring byte-identical.
+// SERVER_STEP_COVER_GUARD=1 makes a mis-indexed segment abstain (no λ, no
+// carry, no blend). The R-225 floor is untouched: its windows are contiguous,
+// so the cum deficit is order-independent (its one leak, a non-stepping
+// window's GPS, is tallied in meta.fuse.cv.flLeak and left for its own round).
+const SERVER_STEP_COVER_GUARD = process.env.SERVER_STEP_COVER_GUARD === '1';
+const STEP_COVER_SLACK_S      = 5;     // fix-clock vs step-clock tolerance (s)
 const userLambda2 = new Map();          // user_id → { lam, n, src } — relay lifetime
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
@@ -620,6 +662,90 @@ const userLambda2 = new Map();          // user_id → { lam, n, src } — relay
 const SERVER_AUTH_DRYRUN          = true;   // C0: compute + log AUTH-DELTA
 const SERVER_AUTHORITATIVE_DISTANCE = true;  // C1 LIVE 2026-08-22 — C0 exit criteria passed (6 organic races, rung-1 100%, drift in band); revert = false + reload
 const AUTH_FX_STALE_MS            = 20000;  // no fx for this long → fall to rung 2
+// ── R-238 / R-239 (audit OT-03 / OT-04, 2026-09-11) ─────────────────────────
+// R-238: st.authDist and the v2 ledger live in memory only, so a relay restart
+// mid-race rebuilt every racer at 0 credit (hydrateRacerFromDb restores lifecycle
+// only) and an honest finisher was then flagged server_credit_low. With
+// SERVER_CREDIT_PERSIST=1 the ladder value is written to room_members every
+// CREDIT_PERSIST_MS (service_role columns server_cred_m/_at/_meta, DDL 11-Sep)
+// and a FRESH racer state seeds st.authDist / the ledger base from it. A racer
+// whose race predates this process and who has NO persisted credit is marked
+// credit-unknown: finishClaimDivergent ABSTAINS (never demotes, never zeroes)
+// and the ledger meta records the reason. Off (default): no write, no read,
+// no abstain — byte-for-byte the old behaviour.
+// R-239: rung-1 credit was bounded only by CLIENT fix timestamps, so forged fx
+// bought credit faster than wall time allowed. The R-61 wall budget is now a
+// CEILING on rung 1 too: base + BUDGET_FLOOR_M + cap×margin×(server time since
+// the anchor: race start, or the first ladder frame). Anchored once, never
+// per frame — the per-frame floor the budget uses would make a 1 Hz stream
+// worth 25 m/s. Off (default): the ceiling is computed and R239-WALL-BOUND is
+// logged when it WOULD bind (dry-run telemetry, same idiom as the step floor),
+// scoring untouched. On: authM = min(authM, ceiling) on rung 1.
+const SERVER_CREDIT_PERSIST    = process.env.SERVER_CREDIT_PERSIST === '1';
+const SERVER_CREDIT_WALL_BOUND = process.env.SERVER_CREDIT_WALL_BOUND === '1';
+const CREDIT_PERSIST_MS        = 15000;
+const BOOT_TS                  = Date.now();
+// ── Audit 16-Sep (A-07 / RELAYSCORE-1): the ceiling pace is a SCORE cap ──────
+// BUDGET×1.5 (running 75 km/h) was written as an admission bound for the R-61
+// claim trim, never as a pace anyone could be scored at — yet it is the only
+// pace the R-239 wall ceiling and the R-168 rung-2 bound know. A forger who
+// stamps fixes 1 s apart at 11 m/s but delivers three per wall second is
+// credited at 11 m/s of fix time, and rung 2 pays a learned rate up to 20.8
+// m/s for as long as fixes stay away. Under SERVER_CREDIT_SCORE_CAPS=1 the wall
+// ceiling and the rung-2 rate are bounded by SERVER_CREDIT_SCORE_CAPS_MPS
+// (elite pace, ~2× an honest racer: DB 15-Sep, 0 of 302 live crossings in 30 d
+// carry a wall hold), and rung 2 stops advancing after R168_RUNG2_MAX_GAP_S —
+// holds flat, never regresses; the backlog on resume re-credits through rung 1.
+// Unset: the score ceiling is computed and R239-SCORE-DRY / R168-RUNG2-CAP
+// lines say where it WOULD bind; scoring byte-identical. The binding of the
+// wall ceiling itself is still SERVER_CREDIT_WALL_BOUND (flip both).
+const SERVER_CREDIT_SCORE_CAPS = process.env.SERVER_CREDIT_SCORE_CAPS === '1';
+const SERVER_CREDIT_SCORE_CAPS_MPS = { running: 7, walking: 3, cycling: 17, swimming: 3 };
+const SERVER_CREDIT_SCORE_CAP_UNKNOWN_MPS = 7;
+const R168_RUNG2_MAX_GAP_S     = 120;
+// A-07 (3): fix timestamps are client-supplied and were never compared with
+// the wall clock, so a future-dated or pre-race-dated fix is ingested as
+// credit. Bounds: older than the race start minus SHADOW_FX_SKEW_PAST_MS (a
+// replayed old track), or newer than the relay clock plus SHADOW_FX_SKEW_FUTURE_MS. Unset:
+// counted (meta.skew) and logged, never dropped — a device clock that lies
+// would otherwise cost an honest racer rung 1 for the whole race, and the dry
+// count is what says whether any real phone ever trips it.
+const SERVER_CREDIT_FX_SKEW    = process.env.SERVER_CREDIT_FX_SKEW === '1';
+const SHADOW_FX_SKEW_PAST_MS   = 60000;
+const SHADOW_FX_SKEW_FUTURE_MS = 30000;
+// ── A-01 / CHEAT-01: a crossing needs a fix to have been ingested ───────────
+// recordCrossing fired on the ladder value alone, and with no fx the ladder IS
+// rung 2 = the budgeted client claim — so a socket that never sent a fix won a
+// ranked race in ~50 s with {distance_m: N}. The same zero-fix signature R-107
+// already treats as positive forgery at the client's own 'finished' relay
+// (no_server_fixes) now applies at crossing time, which the forger cannot skip.
+// SERVER_CREDIT_CROSSING_FX=1: a would-be 'live' crossing with no fix ever
+// ingested is stamped source='claim' and NOT resolved (the run is kept, the
+// rank waits for the claim path, where A-03's witness gate rules). Unset: the
+// crossing resolves exactly as today and CROSSING-UNWITNESSED is logged. The
+// evidence (fixes_n, r1_frames) is written either way once the DDL is live;
+// against the old DB the insert/RPC fall back to their original shapes.
+const SERVER_CREDIT_CROSSING_FX = process.env.SERVER_CREDIT_CROSSING_FX === '1';
+// ── R-250 / A-06 / A-13: JOIN authorisation ──────────────────────────────────
+// The socket was authenticated (JWT) but never authorised: any signed-in user
+// joined any roomId as 'racer', held a racer slot, chatted after a kick, forged
+// 'finished', read private room rows via request_room — and on a relay with no
+// racer state for the room (ws-backup, or the primary right after a restart) a
+// spectator's 'race_over all_done' ended the race for everyone (CHEAT-04).
+// One room_members + room_kicks read per socket, in parallel with getUser so
+// JOIN latency is unchanged. SERVER_JOIN_AUTHZ=1: no member row / kicked →
+// close 4003; DB role 'spectator' with query role 'racer' → downgraded (never
+// closed: an old client may send a stale role). Unset: the same reads run and
+// REJECT not-member / ROLE-DOWNGRADE lines are logged with (dry), nothing is
+// refused. FAILS OPEN on a read error either way (a Supabase blip must not
+// lock 8 racers out mid-race — same idiom as hydrateRacerFromDb). TEST_MODE
+// (no supabase) skips the read: racebot unaffected.
+const SERVER_JOIN_AUTHZ        = process.env.SERVER_JOIN_AUTHZ === '1';
+// A-06 (3): a transient host_id read miss used to pin room.hostId = null, after
+// which every host control (end/kick/host-quit close) was refused for the life
+// of the room object. A miss now leaves it undefined and is retried after this
+// negative TTL; a genuine NULL host_id (delete-account) is still cached as such.
+const HOST_ID_MISS_TTL_MS      = 2000;
 // ── R-168 rung-2 gap bound ───────────────────────────────────────────────────
 // 2026-09-05 race 27e4041f: a racer walked a 30 m box for 10 min, rung 1 had
 // credited 23 m (every segment below the stillness gate), then ONE rung-2 frame
@@ -708,6 +834,21 @@ const STATIONARY_WARN_MS    = 60 * 1000;
 // becomes the pattern. Supersedes the room-level 10-min stationary clock
 // (ROOM_INACTIVITY, now opt-in) and the per-racer 10-min stationary warning.
 const PROGRESS_FLOOR_ENABLED   = process.env.PROGRESS_FLOOR !== '0';   // kill switch
+// R-269: judge the floor on the authoritative ladder (st.authDist: rung 1 when fixes
+// flow, the bounded rung 2 otherwise) instead of the rung-2 budget sample, and treat
+// a racer whose socket still answers protocol pings but has sent no JS frame for a
+// whole window as SUSPENDED: warned, never evicted here (the disconnect and gap
+// clocks own true absence). Unset = today's judge; the auth series is still kept
+// and PROGRESS-AUTH-DRY logs where the two judges would disagree. Backtest 12-Sep
+// over the 09/10-Sep pocket races (11 rooms, both phones): worst 5-min auth gain
+// 67 m vs the 25 m floor, no warn on either judge.
+const SERVER_PROGRESS_FLOOR_AUTH = process.env.SERVER_PROGRESS_FLOOR_AUTH === '1';
+// The ladder trails a resumed claim by a few seconds (racebot progress-cured: one
+// bot cured with 13 m, its twin held 4 m at the same deadline). When the rung-2
+// claim has moved by the cure need but the ladder has not, HOLD the warning for
+// one more period instead of evicting — at most this many times (3 min in prod),
+// so a parked forger is still evicted, one warn period late per hold.
+const PROGRESS_AUTH_MAX_HOLDS    = 3;
 const PROGRESS_WINDOW_MS       = (TEST_MODE && Number(process.env.TEST_PROGRESS_WINDOW_MS)) || 5 * 60 * 1000;
 const PROGRESS_GRACE_MS        = (TEST_MODE && Number(process.env.TEST_PROGRESS_GRACE_MS))  || 3 * 60 * 1000;
 const PROGRESS_WARN_MS         = (TEST_MODE && Number(process.env.TEST_PROGRESS_WARN_MS))   || 60 * 1000;
@@ -885,6 +1026,36 @@ function sendTerminalWithRetry(room, client) {
   attempt();
 }
 
+// A-06 (3): the one host_id lookup every host-gated path shares. Resolves once
+// per room object and caches the answer — including a genuine NULL (host-less
+// room after delete-account). A read error or an empty read is NOT an answer:
+// it leaves room.hostId undefined, stamps hostIdMissAt so a burst of callers
+// does not hammer the read, and the caller stands down for THIS event only.
+// Before this, the four sites each pinned null on a miss and every later host
+// control in the room was refused. Returns { hostId, status } — status is only
+// set on the read that resolved it (callers that care check it there).
+async function resolveHostId(roomId, room, tag) {
+  if (room.hostId !== undefined) return { hostId: room.hostId, status: room.hostStatus };
+  if (!supabase) return { hostId: undefined, status: undefined };
+  const now = Date.now();
+  if (room.hostIdMissAt && now - room.hostIdMissAt < HOST_ID_MISS_TTL_MS) return { hostId: undefined, status: undefined };
+  try {
+    const { data, error } = await supabase.from('race_rooms').select('host_id, status').eq('id', roomId).maybeSingle();
+    if (error || !data) {
+      room.hostIdMissAt = now;
+      log(`${tag} host lookup miss room=${roomId} err=${error ? error.message : 'no row'}`);
+      return { hostId: undefined, status: undefined };
+    }
+    room.hostId = data.host_id;
+    room.hostStatus = data.status;
+    return { hostId: room.hostId, status: room.hostStatus };
+  } catch (e) {
+    room.hostIdMissAt = now;
+    log(`${tag} host lookup failed`, roomId, e && e.message);
+    return { hostId: undefined, status: undefined };
+  }
+}
+
 // Finalize a room's status server-side ONLY as a fallback for a genuinely-absent
 // host. Completeness is NOT decided here — it is inherited from the caller's
 // verified race_over reason (checkRaceComplete already passed on a client). This
@@ -895,15 +1066,10 @@ async function maybeServerFinalize(roomId, room) {
   if (room.finalizing) return;       // one in-flight attempt per room
 
   // Resolve the host authoritatively, once (never trust a client-supplied id).
-  if (room.hostId === undefined) {
-    try {
-      const { data } = await supabase
-        .from('race_rooms').select('host_id, status').eq('id', roomId).single();
-      room.hostId = data ? data.host_id : null;
-      if (data && data.status !== 'racing') return;   // already settled/closed
-    } catch (e) { log('SERVER-FINALIZE host lookup failed', roomId, e && e.message); return; }
-  }
-  if (!room.hostId) return;
+  const fresh = room.hostId === undefined;
+  const { hostId, status } = await resolveHostId(roomId, room, 'SERVER-FINALIZE');
+  if (fresh && status && status !== 'racing') return;   // already settled/closed
+  if (!hostId) return;
 
   const hostConnected = () => {
     for (const c of room.clients) if (c.userId === room.hostId) return true;
@@ -1016,9 +1182,31 @@ async function hydrateRacerFromDb(roomId, room, userId, st) {
   if (!supabase) return;                                  // TEST_MODE: fully inert
   try {
     const { data: m, error } = await supabase.from('room_members')
-      .select('lifecycle, lifecycle_reason, lifecycle_at').eq('room_id', roomId).eq('user_id', userId)
+      .select(SERVER_CREDIT_PERSIST ? 'lifecycle, lifecycle_reason, lifecycle_at, server_cred_m, server_cred_at'
+                                    : 'lifecycle, lifecycle_reason, lifecycle_at')
+      .eq('room_id', roomId).eq('user_id', userId)
       .eq('role', 'racer').maybeSingle();
     if (error) { log('HYDRATE read failed', roomId, userId, error.message); return; }
+    // R-238: seed the ladder from the persisted credit (restart / GC rebuild).
+    // Only ever raises: memory is newer whenever it is already ahead.
+    if (SERVER_CREDIT_PERSIST && m && rooms.get(roomId) === room && room.racers.get(userId) === st
+        && !st.finished && !st.quit && !st.evicted) {
+      const credM = Number(m.server_cred_m);
+      if (Number.isFinite(credM) && credM > 0) {
+        if (credM > (st.authDist || 0)) {
+          st.authDist = credM;
+          st.baselineDist = Math.max(st.baselineDist || 0, credM);
+          st.acceptedDist = Math.max(st.acceptedDist || 0, credM);
+          if (st.shadow) st.shadow.seedM = Math.max(st.shadow.seedM || 0, credM);
+          if (st.wallBaseM != null) st.wallBaseM = Math.max(st.wallBaseM, credM);
+          st.persistedM = credM;
+          st.credSeedDbM = credM;
+          log(`HYDRATE-CREDIT room=${roomId} user=${userId} auth=${credM} at=${m.server_cred_at || '?'}`);
+        }
+      } else {
+        st.credNoPersist = true;
+      }
+    }
     if (!m || !m.lifecycle || m.lifecycle === 'active') return;
     // The room may have been replaced or torn down while the read was in flight,
     // and the racer's own state may have advanced on a relay. Memory wins then.
@@ -1318,7 +1506,7 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
 function shCapMps(sh)  { return (sh && sh.capMps)  || SHADOW_MAX_CREDIT_MPS; }
 function shTeleMps(sh) { return (sh && sh.teleMps) || SHADOW_TELEPORT_MPS; }
 
-function shadowIngest(st, fx, activity) {
+function shadowIngest(st, fx, activity, startedAtMs) {
   let sh = st.shadow;
   if (!sh) sh = st.shadow = { last: null, rawM: 0, credM: 0, n: 0, firstTs: 0, lastTs: 0,
                               drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false,
@@ -1341,6 +1529,9 @@ function shadowIngest(st, fx, activity) {
                               ssGateM: 0, silM: 0, silN: 0,
                               // R-144 blend accumulators + per-fix accuracy sums
                               accSum: 0, accN: 0, blendUpM: 0, blendDnM: 0, blendN: 0,
+                              // R-310 coverage guard tallies (dry and live)
+                              seenTs: 0, fxFull: false, cvN: 0, cvM: 0, cvBlendM: 0, cvCalN: 0, cvLogN: 0,
+                              cvWhy: { spent: 0, over: 0, overL: 0, burst: 0 }, flLeakM: 0,
                               nis: [], spd: { lo: 0, hi: 0, na: 0 }, fx: [],
                               seedM: 0, lastFxWallTs: 0 };
   // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
@@ -1357,19 +1548,34 @@ function shadowIngest(st, fx, activity) {
                    starvM: sh.starvM, stepM: sh.stepM, ts: sh.lastTs, wall: Date.now() };
   }
   const list = fx.length > SHADOW_MAX_FX_PER_MSG ? fx.slice(0, SHADOW_MAX_FX_PER_MSG) : fx;
+  // R-310: a full-cap message means the client queue held ≥ 120 fixes — the
+  // rest of a reconnect backlog is on the next message.
+  sh.fxFull = list.length >= SHADOW_MAX_FX_PER_MSG;
   // R-165: per-activity caps; room meta hydrates on the first frame, so an
   // early frame with no activity runs at the foot caps and upgrades next frame.
   sh.capMps  = SHADOW_CREDIT_CAP_MPS_BY_ACT[activity] || SHADOW_MAX_CREDIT_MPS;
   sh.act     = activity || sh.act || null;   // R-225: foot-sport gate reads this
   sh.teleMps = SHADOW_TELEPORT_MPS_BY_ACT[activity]   || SHADOW_TELEPORT_MPS;
+  const nowWall = Date.now();
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
     if (!Array.isArray(f) || f.length < 4) { sh.drop.bad++; continue; }
     const [t, la, ln, ac, spd] = f;
     if (!Number.isFinite(t) || !Number.isFinite(la) || !Number.isFinite(ln) ||
         la < -90 || la > 90 || ln < -180 || ln > 180) { sh.drop.bad++; continue; }
+    // A-07 (3): a fix stamped before the race (minus slack) or after the relay's
+    // own clock (plus slack) is a replayed or pre-dated track. Counted always
+    // (meta.auth.skew, AUTH-DELTA skew=); dropped only under SERVER_CREDIT_FX_SKEW.
+    if ((startedAtMs > 0 && t < startedAtMs - SHADOW_FX_SKEW_PAST_MS) || t > nowWall + SHADOW_FX_SKEW_FUTURE_MS) {
+      sh.skewN = (sh.skewN || 0) + 1;
+      if (SERVER_CREDIT_FX_SKEW) continue;
+    }
     sh.n++;
     if (!sh.firstTs) sh.firstTs = t;
+    // R-310: newest fix ts DELIVERED (accepted or acc-dropped — either proves
+    // the stream reached that time; sh.lastTs moves on accepted fixes only, and
+    // an accuracy-starved stretch would otherwise read as a stale anchor).
+    if (t > sh.seenTs) sh.seenTs = t;
     // Rounding keeps a 14400-fix worst case ~600 KB of jsonb; 6 decimals is
     // ~0.1 m, below anything the gates can resolve.
     if (SHADOW_PERSIST_FIXES && sh.fx) {
@@ -1450,7 +1656,7 @@ function shadowIngestSx(st, sx, userId) {
     }
     if (T < STEP_SEG_MIN_S) continue;   // segment still accumulating; keep the anchor
     const snap = sh.sxSnap || shadowSxSnap(sh);
-    if (T <= STEP_SEG_MAX_S) shadowSxSegment(sh, dS, T, snap);
+    if (T <= STEP_SEG_MAX_S) shadowSxSegment(sh, dS, T, snap, userId);
     else sh.sxDrop++;                   // absurd span — void, credit nothing
     sh.sxLast = { t: ts, c: cum };
     sh.sxSnap = shadowSxSnap(sh);
@@ -1496,7 +1702,10 @@ const strideLoading = new Set();
 function shadowSeedStride(sh, userId) {
   if (sh.strideSeeded) return;
   sh.strideSeeded = true;
-  if (userStride.has(userId)) { sh.strideUser = userStride.get(userId); return; }
+  // R-266: the cache is only the value the first frames run on; every accumulator
+  // (every JOIN) re-reads the row, so a height set after first contact applies to
+  // the next race instead of the next relay restart.
+  if (userStride.has(userId)) sh.strideUser = userStride.get(userId);
   if (!supabase || strideLoading.has(userId)) return;
   strideLoading.add(userId);
   supabase.from('users').select('height_cm').eq('id', userId).maybeSingle()
@@ -1575,7 +1784,15 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
       }
     }
   }
-  if (dS < STEP_MOVE_MIN_STEPS) return;                    // not demonstrably stepping
+  if (dS < STEP_MOVE_MIN_STEPS) {                          // not demonstrably stepping
+    // R-310: this window's GPS credit was consumed by the ingest-order diff
+    // but never enters flGpsM, so the cumulative deficit (Σest − Σgps) runs
+    // high by a still window's credit (drift, pin-recovery hop). Measured, not
+    // scored: 0 m on the 12-Sep burst race, 23-36 m on e7551b10 (realme) —
+    // not part of either double count; flLeakM tells whether it ever is.
+    sh.flLeakM += credDelta + starvDelta;   // telemetry only this round (see the flag block)
+    return;
+  }
   // R-231: Profile-height stride on walking-cadence windows, when flagged.
   const userLam = (SERVER_STEP_FLOOR_USER_STRIDE && sh.strideUser > 0 && cadence <= STEP_STRIDE_WALK_MAX_SPS)
     ? sh.strideUser : null;
@@ -1624,19 +1841,35 @@ function shadowFloorScoreM(sh) {
 function shadowSxSnap(sh) {
   return { credM: sh.credM, starvM: sh.starvM, stillMs: sh.stillMs, n: sh.n,
            accSum: sh.accSum, accN: sh.accN,
+           coverTs: sh.seenTs,                    // R-310: newest delivered fix ts at anchor time
            la: sh.last ? sh.last.la : null, ln: sh.last ? sh.last.ln : null };
 }
 
 // Close one step segment: calibrate λ from it if the GPS inside was clean, or
 // bank step-distance if GPS provably missed it (starved or pinned). Every
 // branch is bounded; a segment that fits neither classification credits nothing.
-function shadowSxSegment(sh, dS, T, snap) {
+function shadowSxSegment(sh, dS, T, snap, userId) {
   const cadence = dS / T;
   if (cadence > STEP_CADENCE_MAX_SPS) { sh.sxDrop++; return; }   // shaking, not walking
   const credDelta  = Math.max(0, sh.credM - snap.credM);
   const starvDelta = Math.max(0, sh.starvM - snap.starvM);
   const stillS     = Math.max(0, (sh.stillMs - snap.stillMs) / 1000);
   const fixHz      = Math.max(0, sh.n - snap.n) / T;
+  // R-310: does the ingest-order diff describe THIS timestamp span? (see the
+  // flag block). null = yes; otherwise the reason it does not.
+  const nDiff    = Math.max(0, sh.n - snap.n);
+  const segStart = sh.sxLast ? sh.sxLast.t : 0;
+  const segEnd   = segStart + T * 1000;
+  const slackMs  = STEP_COVER_SLACK_S * 1000;
+  const coverTs  = snap.coverTs || 0;
+  const mis = !segStart ? null
+            : (coverTs && coverTs >= segEnd - slackMs)               ? 'spent'
+            : (sh.seenTs > segEnd + slackMs)                          ? 'over'
+            : (nDiff / T >= STEP_CLEAN_MIN_FIXHZ && coverTs && coverTs < segStart - slackMs) ? 'overL'
+            : (sh.fxFull && nDiff === 0)                              ? 'burst'
+            : null;
+  if (mis) sh.cvWhy[mis]++;
+  const skip = !!mis && SERVER_STEP_COVER_GUARD;
   // Net chord across the segment: a hard LOWER bound on true path length —
   // this is what lets stepM subsume the R-141 gap chord without double-count.
   const netM = (snap.la != null && sh.last && Number.isFinite(sh.last.la))
@@ -1654,7 +1887,8 @@ function shadowSxSegment(sh, dS, T, snap) {
   // anchored to genuinely-good windows).
   const clean = fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_CLEAN_MIN_STEPS &&
                 credDelta > 0 && accMean <= 12;
-  if (clean) {
+  if (clean && mis) sh.cvCalN++;          // R-310: would have taught λ an inflated ratio
+  if (clean && !skip) {
     let ratio = credDelta / dS;
     if (ratio >= STEP_LAMBDA_MIN && ratio <= STEP_LAMBDA_MAX) {
       if (sh.lamN >= 5) {
@@ -1694,6 +1928,11 @@ function shadowSxSegment(sh, dS, T, snap) {
     if (dS < STEP_MOVE_MIN_STEPS) return;
     const add = Math.max(0, est - gps);
     if (add <= 0) return;
+    if (mis) {                                                        // R-310
+      sh.cvM += add; sh.cvN++;
+      shadowCoverLog(sh, userId, mis, starved ? 'starved' : 'pinned', add, T, dS, nDiff, coverTs, segStart, segEnd);
+      if (skip) return;
+    }
     sh.stepM += add;
     sh.stepN++;
     sh.stepSec += Math.round(T);
@@ -1717,6 +1956,11 @@ function shadowSxSegment(sh, dS, T, snap) {
         + 0.3 * Math.max(0, (accMean - 10) / 20);
   w = Math.min(STEP_BLEND_W_MAX, w);
   const adj = w * (estB - gps);
+  if (mis && Math.abs(adj) > 0.5) {                                   // R-310
+    sh.cvBlendM += adj; sh.cvN++;
+    shadowCoverLog(sh, userId, mis, 'blend', adj, T, dS, nDiff, coverTs, segStart, segEnd);
+    if (skip) return;
+  }
   if (adj > 0.5) {
     sh.blendUpM += adj; sh.blendN++;
   } else if (adj < -0.5 && sh.lamN >= STEP_CLEAN_FOR_CAL) {
@@ -1724,6 +1968,17 @@ function shadowSxSegment(sh, dS, T, snap) {
     // subtract metres GPS actually measured.
     sh.blendDnM += -adj; sh.blendN++;
   }
+}
+
+// R-310: one line on the first mis-indexed segment and every 10th after —
+// the Android hub cadence makes this fire on most segments of a race.
+function shadowCoverLog(sh, userId, why, site, m, T, dS, nDiff, coverTs, segStart, segEnd) {
+  const n = ++sh.cvLogN;
+  if (n !== 1 && n % 10 !== 0) return;
+  log(`STEP-COVER-${SERVER_STEP_COVER_GUARD ? 'SKIP' : 'DRY'} user=${userId || '?'} why=${why} at=${site} ` +
+      `m=${m.toFixed(1)} T=${Math.round(T)}s dS=${dS} nDiff=${nDiff} ` +
+      `anchor=${coverTs ? Math.round((coverTs - segStart) / 1000) : '-'}s now=${sh.seenTs ? Math.round((sh.seenTs - segEnd) / 1000) : '-'}s ` +
+      `n=${n} tot=${Math.round(sh.cvM)}/${Math.round(sh.cvBlendM)} cal=${sh.cvCalN}`);
 }
 
 // Step metres eligible to SCORE: the share cap bounds the blast radius of a
@@ -1763,6 +2018,9 @@ function stepScoreM(sh) {
 // fallback must stay warm). Same monotone + target invariants as the budget.
 // C0 returns budgetM (dry-run); C1 returns authM. st.authDist tracks the ladder
 // in both modes so the flip changes which number the room reads, not the math.
+function scoreCapMpsFor(activity) {
+  return (activity && SERVER_CREDIT_SCORE_CAPS_MPS[activity]) || SERVER_CREDIT_SCORE_CAP_UNKNOWN_MPS;
+}
 function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   const budgetM = budgetedDistance(room, st, claimed, nowTs);
   const sh = st.shadow;
@@ -1779,6 +2037,11 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   // (the default) leaves scoring EXACTLY as before; stepM is telemetry.
   const stepM = sh ? stepScoreM(sh) : 0;   // flag-gated inside; may be negative (blend trim)
   // R-168: rung 2 is bounded by the last rung-1 value + own pace × gap + floor.
+  // A-07: under SERVER_CREDIT_SCORE_CAPS the pace is the SCORE cap (not the
+  // admission budget) and the gap stops paying after R168_RUNG2_MAX_GAP_S —
+  // the bound holds flat there (never regresses; the resume backlog re-credits
+  // through rung 1). Unset: the score bound is computed and R168-RUNG2-CAP
+  // says where it would bind; rung2M is exactly as before.
   let rung2M = budgetM;
   if (!fxFresh && R168_RUNG2_GAP_BOUND && st.r1AnchorTs != null) {
     const gapMs = Math.max(0, nowTs - st.r1AnchorTs);
@@ -1796,8 +2059,60 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
       }
     }
     rung2M = Math.min(budgetM, bound);
+    const scoreCapMps = scoreCapMpsFor(activity);
+    const scoreRate = Math.min(scoreCapMps, Math.max(0, st.r1Rate || 0));
+    const scoreGapS = Math.min(gapMs / 1000, R168_RUNG2_MAX_GAP_S);
+    const scoreBound = st.r1AnchorDist + scoreRate * scoreGapS + R168_GAP_FLOOR_M;
+    if (rung2M > scoreBound + 0.5) {
+      st.r2Cap = (st.r2Cap || 0) + 1;
+      st.r2CapHeldM = Math.round((st.r2CapHeldM || 0) + (rung2M - scoreBound));
+      if (st.r2Cap === 1 || st.r2Cap % 20 === 0) {
+        log(`R168-RUNG2-CAP room=${roomId} user=${userId} rung2=${Math.round(rung2M)} bound=${Math.round(scoreBound)} ` +
+            `anchor=${Math.round(st.r1AnchorDist)} gap=${Math.round(gapMs / 1000)}s rate=${scoreRate.toFixed(2)}m/s ` +
+            `n=${st.r2Cap}${SERVER_CREDIT_SCORE_CAPS ? '(live)' : '(dry)'}`);
+      }
+      if (SERVER_CREDIT_SCORE_CAPS) rung2M = scoreBound;
+    }
   }
   let authM = fxFresh ? Math.max(0, sh.seedM + Math.min(sh.credM + starvM, sh.rawM) + stepM) : rung2M;
+  // R-239: wall-clock ceiling on rung 1 (see the flag block).
+  if (fxFresh) {
+    if (st.wallAnchorTs == null) {
+      const startedAt = room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : null;
+      st.wallAnchorTs = (startedAt && startedAt <= nowTs) ? startedAt : nowTs;
+      st.wallBaseM = Math.max(sh.seedM || 0, st.authDist || 0);
+    }
+    const wActivity = room.meta && room.meta.activity;
+    const wBudgetMps = ((wActivity ? (BUDGET_SPEED_CAPS_KMH[wActivity] || BUDGET_UNKNOWN_CAP_KMH)
+                                   : BUDGET_UNKNOWN_CAP_KMH) * BUDGET_MARGIN) / 3.6;
+    // A-07: the ceiling pace is the SCORE cap once flagged; the budget pace
+    // (75 km/h running) stays the ceiling until then. Both flags must be on
+    // for the score ceiling to bind (WALL_BOUND = bind, SCORE_CAPS = pace).
+    const wCapMps = SERVER_CREDIT_SCORE_CAPS ? scoreCapMpsFor(wActivity) : wBudgetMps;
+    const wallS = Math.max(0, nowTs - st.wallAnchorTs) / 1000;
+    const wallCeilM = st.wallBaseM + BUDGET_FLOOR_M + wCapMps * wallS;
+    if (!SERVER_CREDIT_SCORE_CAPS) {
+      const scoreCeilM = st.wallBaseM + BUDGET_FLOOR_M + scoreCapMpsFor(wActivity) * wallS;
+      if (authM > scoreCeilM + 0.5) {
+        st.scoreBound = (st.scoreBound || 0) + 1;
+        st.scoreHeldM = Math.round((st.scoreHeldM || 0) + (authM - scoreCeilM));
+        if (st.scoreBound === 1 || st.scoreBound % 20 === 0) {
+          log(`R239-SCORE-DRY room=${roomId} user=${userId} auth=${Math.round(authM)} ceil=${Math.round(scoreCeilM)} ` +
+              `base=${Math.round(st.wallBaseM)} wall=${Math.round(wallS)}s cap=${scoreCapMpsFor(wActivity)}m/s n=${st.scoreBound}`);
+        }
+      }
+    }
+    if (authM > wallCeilM + 0.5) {
+      st.wallBound = (st.wallBound || 0) + 1;
+      st.wallHeldM = Math.round((st.wallHeldM || 0) + (authM - wallCeilM));
+      if (st.wallBound === 1 || st.wallBound % 20 === 0) {
+        log(`R239-WALL-BOUND room=${roomId} user=${userId} auth=${Math.round(authM)} ceil=${Math.round(wallCeilM)} ` +
+            `base=${Math.round(st.wallBaseM)} wall=${Math.round(wallS)}s cap=${wCapMps.toFixed(2)}m/s ` +
+            `n=${st.wallBound}${SERVER_CREDIT_WALL_BOUND ? '(live)' : '(dry)'}${SERVER_CREDIT_SCORE_CAPS ? ' score' : ''}`);
+      }
+      if (SERVER_CREDIT_WALL_BOUND) authM = wallCeilM;
+    }
+  }
   authM = Math.max(st.authDist || 0, authM);
   const targetM = room.meta && room.meta.targetM;
   if (targetM > 0) authM = Math.min(authM, targetM);
@@ -1826,7 +2141,11 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : '') +
         (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : '') +
         (sh && (sh.blendUpM || sh.blendDnM) ? ` blend=+${Math.round(sh.blendUpM)}/-${Math.round(sh.blendDnM)}${SERVER_STEP_BLEND ? '(live)' : '(dry)'}` : '') +
-        (st.r2Bound ? ` r2hold=${st.r2HeldM}/${st.r2Bound}${R168_RUNG2_GAP_BOUND ? '(live)' : '(off)'}` : ''));
+        (sh && sh.cvN ? ` cover=${Math.round(sh.cvM)}/${Math.round(sh.cvBlendM)}/${sh.cvN}${SERVER_STEP_COVER_GUARD ? '(live)' : '(dry)'}` : '') +
+        (st.r2Bound ? ` r2hold=${st.r2HeldM}/${st.r2Bound}${R168_RUNG2_GAP_BOUND ? '(live)' : '(off)'}` : '') +
+        (st.r2Cap ? ` r2cap=${st.r2CapHeldM}/${st.r2Cap}${SERVER_CREDIT_SCORE_CAPS ? '(live)' : '(dry)'}` : '') +
+        (st.scoreBound ? ` score=${st.scoreHeldM}/${st.scoreBound}(dry)` : '') +
+        (sh && sh.skewN ? ` skew=${sh.skewN}${SERVER_CREDIT_FX_SKEW ? '(live)' : '(dry)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
 }
@@ -1869,7 +2188,24 @@ function finishClaimDivergent(room, st) {
   const targetM = room && room.meta && room.meta.targetM;
   if (!(targetM > 0)) return false;
   if ((st.authN || 0) < FINISH_CLAIM_MIN_FRAMES) return false;
+  // R-238: a state born after a restart with nothing persisted cannot know what
+  // this racer had already earned — abstain, and say so in the ledger.
+  // A-04 (audit 16-Sep): this abstain was itself gated on SERVER_CREDIT_PERSIST,
+  // so with the flag unset (production, 11-Sep → now) every honest finisher in a
+  // race that outlived a deploy was demoted server_credit_low. The test is now
+  // the exact one: race predates this process AND nothing seeded this state.
+  if (creditUnknownAfterBoot(room, st)) {
+    st.credAbstain = 'credit_unknown';
+    return false;
+  }
   return (st.authDist || 0) < targetM * FINISH_CLAIM_MIN_FRAC;
+}
+function creditUnknownAfterBoot(room, st) {
+  return raceStartedBeforeBoot(room) && st.credSeedDbM == null;
+}
+function raceStartedBeforeBoot(room) {
+  const startedAt = room && room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0;
+  return startedAt > 0 && startedAt < BOOT_TS;
 }
 
 // R-107: stamp a divergent self-finished result row flagged. The client writes
@@ -1932,8 +2268,11 @@ function flagDivergentFinish(roomId, userId, authM, targetM, reason = 'server_cr
 // Persist every racer's shadow tally once. Multiple hooks may race (terminal
 // settle, ROOM CLOSED, GC) — the per-racer flag plus the table's PK upsert make
 // that harmless. Fire-and-forget: shadow must never delay teardown paths.
+// Returns the upsert promises (A-04: the shutdown flush awaits them under a
+// budget); every existing caller ignores the return value.
 function flushShadow(roomId, room, via) {
-  if (!SERVER_SHADOW_DISTANCE || !supabase || !room || !room.racers) return;
+  const pending = [];
+  if (!SERVER_SHADOW_DISTANCE || !supabase || !room || !room.racers) return pending;
   for (const [userId, st] of room.racers) {
     const sh = st.shadow;
     if (!sh || sh.flushed || sh.n === 0) continue;
@@ -1973,7 +2312,7 @@ function flushShadow(roomId, room, via) {
       // and whether it SCORED. The dry-run go/no-go reads: on a pocket race the
       // degraded device's cred + starv + fuse.m ≈ the healthy device's credit;
       // on healthy/parked/shake races fuse.m ≈ 0 (absent = no segments banked).
-      if (sh.stepN || sh.lamN || sh.sxDrop || sh.blendN || sh.flN || sh.lam2N || sh.ssN || sh.silN) {
+      if (sh.stepN || sh.lamN || sh.sxDrop || sh.blendN || sh.flN || sh.lam2N || sh.ssN || sh.silN || sh.cvN || sh.cvCalN) {
         meta.fuse = { m: Math.round(sh.stepM), n: sh.stepN, sec: sh.stepSec,
                       pinM: Math.round(sh.pinM), lam: Math.round(sh.lambda * 100) / 100,
                       lamN: sh.lamN, drop: sh.sxDrop, live: SERVER_STEP_FUSION,
@@ -1983,6 +2322,14 @@ function flushShadow(roomId, room, via) {
                       // whose GPS matched its steps all race.
                       up: Math.round(sh.blendUpM), dn: Math.round(sh.blendDnM),
                       bn: sh.blendN, blive: SERVER_STEP_BLEND,
+                      // R-310 coverage guard: segments whose ingest-order diff
+                      // did not describe their span — carry metres (m) and
+                      // signed blend metres (bm) that were (live) / would be
+                      // (dry) withheld, λ samples withheld (cal), reasons, and
+                      // the floor's non-stepping-window GPS (flLeak).
+                      cv: { n: sh.cvN, m: Math.round(sh.cvM), bm: Math.round(sh.cvBlendM),
+                            cal: sh.cvCalN, why: sh.cvWhy, flLeak: Math.round(sh.flLeakM),
+                            live: SERVER_STEP_COVER_GUARD },
                       // R-225 floor rung: metres/windows/seconds banked, λ2 and
                       // its clean-window count + source, and whether it SCORED.
                       fl: { m: Math.round(sh.flM), n: sh.flN, sec: sh.flSec,
@@ -2037,6 +2384,15 @@ function flushShadow(roomId, room, via) {
         meta.auth = { m: Math.round(st.authDist || 0), n: st.authN,
                       r1: st.authR1 || 0, seedM: Math.round(sh.seedM || 0),
                       live: SERVER_AUTHORITATIVE_DISTANCE };
+        // R-238 / R-239 telemetry: only present when something happened.
+        if (st.wallBound) meta.auth.wall = { held: st.wallHeldM || 0, n: st.wallBound, live: SERVER_CREDIT_WALL_BOUND, score: SERVER_CREDIT_SCORE_CAPS };
+        // A-07 dry readout: where the SCORE ceiling / rung-2 score bound would
+        // have bound (or did, live). Absent on every row they never touched.
+        if (st.scoreBound) meta.auth.score = { held: st.scoreHeldM || 0, n: st.scoreBound };
+        if (st.r2Cap) meta.auth.r2cap = { held: st.r2CapHeldM || 0, n: st.r2Cap, live: SERVER_CREDIT_SCORE_CAPS };
+        if (sh.skewN) meta.auth.skew = { n: sh.skewN, live: SERVER_CREDIT_FX_SKEW };
+        if (st.credSeedDbM) meta.auth.seedDbM = Math.round(st.credSeedDbM);
+        if (st.credAbstain) meta.auth.abstain = st.credAbstain;
       }
     }
     const row = {
@@ -2053,16 +2409,17 @@ function flushShadow(roomId, room, via) {
             (meta.starv ? ` starv=${meta.starv.m}/${meta.starv.n}(${meta.starv.live ? 'live' : 'dry'})` : '') +
             (meta.fuse ? ` fuse=${meta.fuse.m}/${meta.fuse.n} lam=${meta.fuse.lam}/${meta.fuse.lamN}(${meta.fuse.live ? 'live' : 'dry'})` +
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
+                         ` cv=${meta.fuse.cv.m}/${meta.fuse.cv.bm}/${meta.fuse.cv.n}:${meta.fuse.cv.cal} leak=${meta.fuse.cv.flLeak}(${meta.fuse.cv.live ? 'live' : 'dry'})` +
                          ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} us=${meta.fuse.fl.us}/${meta.fuse.fl.usN}(${meta.fuse.fl.uslive ? 'live' : 'dry'}) lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
                          ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
-    supabase.from('race_shadow_distance').upsert(row, { onConflict: 'room_id,user_id', ignoreDuplicates: true })
+    pending.push(supabase.from('race_shadow_distance').upsert(row, { onConflict: 'room_id,user_id', ignoreDuplicates: true })
       .then(({ error }) => { if (error) log('SHADOW upsert failed', roomId, userId, error.message); })
-      .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message));
+      .catch((e) => log('SHADOW upsert error', roomId, userId, e && e.message)));
     if (SHADOW_PERSIST_FIXES && sh.fx && sh.fx.length) {
-      supabase.from('race_shadow_fixes')
+      pending.push(supabase.from('race_shadow_fixes')
         .upsert({ room_id: roomId, user_id: userId, fixes: sh.fx, n: sh.fx.length,
                   // sx alongside the fixes so offline replay can re-run the
                   // fusion against the same race (bounded at 400 samples).
@@ -2070,11 +2427,12 @@ function flushShadow(roomId, room, via) {
                 { onConflict: 'room_id,user_id', ignoreDuplicates: true })
         .then(({ error }) => { if (error) log('SHADOW-FIX upsert failed', roomId, userId, error.message); })
         .catch((e) => log('SHADOW-FIX upsert error', roomId, userId, e && e.message))
-        .finally(() => freeShadowArrays(sh, roomId, userId, via));
+        .finally(() => freeShadowArrays(sh, roomId, userId, via)));
     } else if (via === 'terminal') {
       freeShadowArrays(sh, roomId, userId, via);
     }
   }
+  return pending;
 }
 
 // H-10 (08-Sep-2026): after the terminal flush the per-racer fx / nis / sxLog
@@ -2115,23 +2473,25 @@ function recordReplaySample(room, st, accepted) {
 // fire-and-forget, idempotent via the flushed flag, a lost write costs only
 // this room's canonical replay (clients fall back to their local frames).
 function flushReplayCurves(roomId, room, via) {
-  if (!SERVER_REPLAY_CURVE || !supabase || !room || !room.racers) return;
+  const pending = [];
+  if (!SERVER_REPLAY_CURVE || !supabase || !room || !room.racers) return pending;
   const startedAt = room.meta && room.meta.startedAt;
-  if (!startedAt) return;
+  if (!startedAt) return pending;
   for (const [userId, st] of room.racers) {
     const rc = st.replayCurve;
     if (!rc || rc.flushed || rc.arr.length < 2) continue;
     rc.flushed = true;
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical curve.
-    supabase.from('race_replay_curves').upsert({
+    pending.push(supabase.from('race_replay_curves').upsert({
       room_id: roomId, user_id: userId,
       t0: startedAt, step_ms: REPLAY_STEP_MS, dist_m: rc.arr,
     }, { onConflict: 'room_id,user_id', ignoreDuplicates: true }).then(({ error }) => {
       if (error) log('REPLAY-FLUSH upsert failed', roomId, userId, error.message);
       else log(`REPLAY-FLUSH room=${roomId} user=${userId} samples=${rc.arr.length} via=${via}`);
-    }, (e) => log('REPLAY-FLUSH error', roomId, userId, e && e.message));
+    }, (e) => log('REPLAY-FLUSH error', roomId, userId, e && e.message)));
   }
+  return pending;
 }
 
 async function settleRoom(roomId, status, reason) {
@@ -2219,13 +2579,25 @@ async function evictRacer(roomId, room, userId, reason) {
       return;
     }
     const dbDist = m.last_distance_m || 0;
-    const baseline = Math.max(st.baselineDist || 0, st.lastDist || 0);
+    // A-08 / DBSEC-01: room_members.last_distance_m is the one progress column a
+    // client can write (the 50 m HUD mirror), and this stand-down used to copy it
+    // into st.lastDist / st.baselineDist — from where budgetedDistance's first
+    // frame, sh.seedM and recordCrossing's source test all inherit it. One REST
+    // PATCH of target−1 plus a 10-minute disconnect then turned a single
+    // {distance_m: target} frame into a 'live' crossing, ranked and shielded
+    // from R-107 as 'witnessed'. The column may keep a racer IN the race (the
+    // liveness contract the user accepted), never credit them: the comparison
+    // baseline now includes the last DB value the stand-down honoured, so the
+    // racer must keep advancing it to stay alive, and every writer of
+    // baselineDist/lastDist left is relay-owned (distM, HYDRATE-CREDIT,
+    // handleClose, the progress floor).
+    const baseline = Math.max(st.baselineDist || 0, st.lastDist || 0, st.fallbackDbM || 0);
     if (dbDist > baseline + EVICT_PROGRESS_EPS_M) {
       // Fallback-transport liveness: distance advanced without the WS seeing it.
-      st.lastDist = dbDist; st.baselineDist = dbDist;
+      st.fallbackDbM = dbDist;
       st.lastMoveTs = Date.now(); st.warnDeadline = 0;
       if (st.disconnectedAt) st.disconnectedAt = Date.now();  // still gone from WS: restart the 10min clock
-      log(`EVICT stand-down (fallback progress) room=${roomId} user=${userId} db=${dbDist}`);
+      log(`EVICT stand-down (fallback progress) room=${roomId} user=${userId} db=${dbDist} auth=${Math.round(st.authDist || 0)} (not credited)`);
       return;
     }
     if (!room.meta) {
@@ -2303,8 +2675,8 @@ async function maybeWarnStationary(roomId, room, userId, st) {
     if (room.terminal || room.inactivityWarnDeadline) return;
     if (st.finished || st.quit || st.evicted || st.warnDeadline) return;
     if (Date.now() - st.lastMoveTs < STATIONARY_EVICT_MS) return;  // moved during the check
-    const myRow = (members || []).find(mm => mm.user_id === userId);
-    st.baselineDist = Math.max(myRow?.last_distance_m || 0, st.lastDist || 0);
+    // A-08: the DB term is gone from this seed too (client-writable column).
+    st.baselineDist = Math.max(st.baselineDist || 0, st.lastDist || 0);
     st.warnDeadline = Date.now() + STATIONARY_WARN_MS;
     for (const c of room.clients) if (c.userId === userId)
       send(c, { event: 'stationary_warning', payload: { deadline: st.warnDeadline } });
@@ -2350,11 +2722,14 @@ async function ensureBudgetMeta(roomId, room) {
   room.metaFetching = true;
   try {
     const { data: r } = await supabase
-      .from('race_rooms').select('started_at, target_distance_m, activity_type')
+      .from('race_rooms').select('started_at, target_distance_m, activity_type, host_id, status')
       .eq('id', roomId).single();
     if (r) {
       room.meta = { startedAt: r.started_at, targetM: r.target_distance_m,
                     activity: r.activity_type || null };
+      // A-06 (3): this read already happens on every room's first frames, so
+      // the host is known before any host-gated event needs its own lookup.
+      if (room.hostId === undefined) { room.hostId = r.host_id; room.hostStatus = r.status; }
     }
   } catch (e) { log('BUDGET-META error', roomId, e && e.message); }
   finally { room.metaFetching = false; }
@@ -2441,23 +2816,30 @@ function progressSample(st, now, accepted, room) {
     // the DB/hydrate baseline seeded (never more than this first frame).
     const seed = (startedAt && st.progJoinTs && st.progJoinTs <= startedAt) ? 0
                : Math.min(accepted, Math.max(st.baselineDist || 0, 0));
-    if (epoch && epoch < now) pl.push([epoch, seed]);
+    if (epoch && epoch < now) pl.push([epoch, seed, seed]);
   }
+  const authM = (st.authN || 0) > 0 ? (st.authDist || 0) : accepted;
   const last = pl[pl.length - 1];
-  if (!last || now - last[0] >= 5000 || accepted > last[1]) pl.push([now, accepted]);
+  if (!last || now - last[0] >= 5000 || accepted > last[1]) pl.push([now, accepted, authM]);
   // keep exactly one sample at/before the window edge so the reference exists
   const cutoff = now - PROGRESS_WINDOW_MS - 10000;
   while (pl.length > 1 && pl[1][0] <= cutoff) pl.shift();
 }
-function progressGain(st, now, epoch) {
+// R-269: index 1 = rung-2 budget sample, index 2 = authoritative ladder sample.
+function progressCurM(st, useAuth) {
+  return useAuth && (st.authN || 0) > 0 ? (st.authDist || 0) : (st.acceptedDist || 0);
+}
+function progressGain(st, now, epoch, useAuth = SERVER_PROGRESS_FLOOR_AUTH) {
   const pl = st.progLog;
   if (!pl || !pl.length) return null;
   const since = Math.max(now - PROGRESS_WINDOW_MS, epoch || 0);
   let ref = null;
   for (const smp of pl) { if (smp[0] <= since) ref = smp; else break; }
   if (!ref) ref = pl[0];
-  const cur = Math.max(st.acceptedDist || 0, pl[pl.length - 1][1]);
-  return { gain: cur - ref[1], refTs: ref[0], cur };
+  const ix = useAuth ? 2 : 1;
+  const at = (smp) => (smp[ix] == null ? smp[1] : smp[ix]);
+  const cur = Math.max(progressCurM(st, useAuth), at(pl[pl.length - 1]));
+  return { gain: cur - at(ref), refTs: ref[0], cur };
 }
 function progressFloorSweep(roomId, room, uid, st, now) {
   const startedAt = room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0;
@@ -2470,10 +2852,21 @@ function progressFloorSweep(roomId, room, uid, st, now) {
   if (epoch > startedAt && now - epoch < PROGRESS_WINDOW_MS) return;
   const g = progressGain(st, now, epoch);
   if (!g) return;                                   // no accepted frame yet: nothing to judge
+  // R-269 dry run: where the auth-judged floor would disagree with the live judge.
+  if (!SERVER_PROGRESS_FLOOR_AUTH && (st.authN || 0) > 0 && (!st.progAuthDryTs || now - st.progAuthDryTs >= 60000)) {
+    const ga = progressGain(st, now, epoch, true);
+    if (ga && ((ga.gain < floorM) !== (g.gain < floorM))) {
+      st.progAuthDryTs = now;
+      log(`PROGRESS-AUTH-DRY room=${roomId} user=${uid} budget_gain=${Math.round(g.gain)} auth_gain=${Math.round(ga.gain)} floor=${floorM} ` +
+          `silent=${st.lastDataTs ? Math.round((now - st.lastDataTs) / 1000) : '?'}s`);
+    }
+  }
   if (!st.progWarnDeadline) {
     if (g.gain >= floorM) return;
     st.progWarnDeadline = now + PROGRESS_WARN_MS;
     st.progWarnBase = g.cur;
+    st.progWarnBudgetBase = st.acceptedDist || 0;
+    st.progAuthHolds = 0;
     st.progNeedM = Math.max(1, Math.ceil(floorM * PROGRESS_CURE_FRAC));
     st.baselineDist = Math.max(st.baselineDist || 0, g.cur);   // evictRacer's DB stand-down baseline
     const payload = { deadline: st.progWarnDeadline, need_m: st.progNeedM, floor_m: floorM,
@@ -2485,7 +2878,7 @@ function progressFloorSweep(roomId, room, uid, st, now) {
     log(`PROGRESS-WARN room=${roomId} user=${uid} act=${activity || 'unknown'} gain=${Math.round(g.gain)} floor=${floorM} need=${st.progNeedM}`);
     return;
   }
-  const gainedSinceWarn = (st.acceptedDist || 0) - (st.progWarnBase || 0);
+  const gainedSinceWarn = progressCurM(st, SERVER_PROGRESS_FLOOR_AUTH) - (st.progWarnBase || 0);
   if (gainedSinceWarn >= st.progNeedM || g.gain >= floorM) {
     st.progWarnDeadline = 0;
     for (const c of room.clients) if (c.userId === uid) {
@@ -2496,6 +2889,26 @@ function progressFloorSweep(roomId, room, uid, st, now) {
     return;
   }
   if (now >= st.progWarnDeadline) {
+    // R-269: socket alive, JS silent for a whole window = suspended, not idle.
+    // Abstain (keep the warning open) until a frame arrives; the disconnect and
+    // PRESENCE-GAP clocks own true absence.
+    if (SERVER_PROGRESS_FLOOR_AUTH && st.connected && st.lastDataTs && now - st.lastDataTs >= PROGRESS_WINDOW_MS) {
+      if (!st.progSuspLogged) {
+        st.progSuspLogged = true;
+        log(`PROGRESS-SUSPENDED room=${roomId} user=${uid} silent=${Math.round((now - st.lastDataTs) / 1000)}s (abstain)`);
+      }
+      return;
+    }
+    st.progSuspLogged = false;
+    if (SERVER_PROGRESS_FLOOR_AUTH) {
+      const budgetGain = (st.acceptedDist || 0) - (st.progWarnBudgetBase || 0);
+      if (budgetGain >= st.progNeedM && (st.progAuthHolds || 0) < PROGRESS_AUTH_MAX_HOLDS) {
+        st.progAuthHolds = (st.progAuthHolds || 0) + 1;
+        st.progWarnDeadline = now + PROGRESS_WARN_MS;
+        log(`PROGRESS-AUTH-HOLD room=${roomId} user=${uid} budget_gain=${Math.round(budgetGain)} auth_gain=${Math.round(gainedSinceWarn)} need=${st.progNeedM} hold=${st.progAuthHolds}/${PROGRESS_AUTH_MAX_HOLDS}`);
+        return;
+      }
+    }
     st.progWarnDeadline = 0;
     evictRacer(roomId, room, uid, 'progress_timeout');
   }
@@ -2532,33 +2945,63 @@ function recordCrossing(roomId, room, st, userId, accepted) {
   // connection, so the real crossing happened where we could not see it. Marked,
   // never silently treated as a crossing — correcting a rank on one would hand a
   // place to whoever's socket survived, which is the opposite of the fix.
-  const source = (st.baselineDist || 0) >= targetM ? 'baseline' : 'live';
+  let source = (st.baselineDist || 0) >= targetM ? 'baseline' : 'live';
   const elapsed = Math.max(0, now - startedAt);
+  // A-01 / CHEAT-01: a 'live' crossing with no fix ever ingested is the ladder
+  // ranking the bare client claim (rung 2). Under the flag it is stamped as a
+  // 'claim' and not resolved — the claim path (assign_race_position, A-03's
+  // witness gate) owns the rank; nothing about the run is lost. Unset: logged.
+  const fxN = st.shadow ? (st.shadow.n || 0) : 0;
+  const r1N = st.authR1 || 0;
+  if (source === 'live' && fxN === 0 && SERVER_SHADOW_DISTANCE) {
+    log(`CROSSING-UNWITNESSED room=${roomId} user=${userId} frames=${st.authN || 0} fixes=0${SERVER_CREDIT_CROSSING_FX ? '' : ' (dry)'}`);
+    if (SERVER_CREDIT_CROSSING_FX) source = 'claim';
+  }
   log(`CROSSING room=${roomId} user=${userId} elapsed=${elapsed}ms ` +
-      `accepted=${Math.round(accepted)} target=${targetM} source=${source}`);
+      `accepted=${Math.round(accepted)} target=${targetM} source=${source} fixes=${fxN} r1=${r1N}`);
   if (!supabase) return;   // TEST_MODE: crossing observed via the log line only
-  supabase.from('race_crossings').insert({
+  const crossingRow = {
     room_id: roomId, user_id: userId,
     crossed_at: new Date(now).toISOString(),
     crossed_elapsed_ms: elapsed,
     accepted_m: Math.round(accepted),
     target_m: targetM,
     source,
-  }).then(({ error }) => {
+  };
+  // The evidence columns exist only once the A-01 DDL is live; against the old
+  // table the insert is retried in its original shape so a crossing is never
+  // lost to deploy order (PGRST204 = column missing from the schema cache).
+  const insertCrossing = (row, retried) => supabase.from('race_crossings').insert(row).then(({ error }) => {
     // 23505 = the earliest observation already landed, which is the intended
     // outcome of a reconnect and not a problem worth a line.
-    if (error && error.code !== '23505') log('CROSSING write failed', roomId, error.message);
+    if (!error || error.code === '23505') return;
+    if (!retried && (error.code === 'PGRST204' || error.code === '42703')) {
+      log('CROSSING evidence columns absent — retrying legacy shape', roomId);
+      return insertCrossing(crossingRow, true);
+    }
+    log('CROSSING write failed', roomId, error.message);
   }, (e) => log('CROSSING write threw', roomId, e && e.message));
+  insertCrossing({ ...crossingRow, fixes_n: fxN, r1_frames: r1N }, false);
 
   // Crossing-resolve: write the ranked finish NOW, server-side. Same contract as
   // the stamp above — fire-and-forget, swallows its own errors, never costs a
   // frame and never fails a race; a lost write degrades to the pre-fix behaviour
   // (the racer's own claim resolves them at unlock).
   if (SERVER_CROSSING_RESOLVE && source === 'live') {
-    supabase.rpc('resolve_crossing_finish', {
-      p_room_id: roomId, p_user_id: userId,
-      p_elapsed_ms: elapsed, p_distance_m: Math.round(accepted),
-    }).then(({ data: pos, error }) => {
+    // p_fixes_n / p_r1 carry the evidence into the row (A-01 DDL adds them with
+    // NULL defaults; PGRST202 = no such overload yet → the 4-arg call). In dry
+    // mode a zero fix count is sent as NULL ('unknown'), so the DB gate that
+    // unranks fixes_n = 0 cannot fire before the relay flag does.
+    const baseArgs = { p_room_id: roomId, p_user_id: userId, p_elapsed_ms: elapsed, p_distance_m: Math.round(accepted) };
+    const evidence = { p_fixes_n: (fxN > 0 || SERVER_CREDIT_CROSSING_FX) ? fxN : null, p_r1: r1N };
+    const resolve = (args, retried) => supabase.rpc('resolve_crossing_finish', args).then((res) => {
+      if (res.error && !retried && res.error.code === 'PGRST202') {
+        log('CROSSING-RESOLVE evidence args absent — retrying legacy signature', roomId);
+        return resolve(baseArgs, true);
+      }
+      return res;
+    });
+    resolve({ ...baseArgs, ...evidence }, false).then(({ data: pos, error }) => {
       if (error) { log('CROSSING-RESOLVE rpc failed', roomId, userId, error.message); return; }
       // null = room not 'racing', target unmet, or a standing gate verdict
       // (mock/T8/DNF row) this resolve must not overturn — the claim path owns it.
@@ -2797,14 +3240,10 @@ async function maybeCompleteRace(roomId, room) {
 async function maybeCloseHostAbandoned(roomId, room) {
   if (!supabase) return;                        // TEST_MODE: inert
   if (room.terminal || room.hostClosing) return;
-  if (room.hostId === undefined) {
-    try {
-      const { data } = await supabase.from('race_rooms').select('host_id, status').eq('id', roomId).single();
-      room.hostId = data ? data.host_id : null;
-      if (data && data.status !== 'racing') return;   // already settled/closed
-    } catch (e) { log('HOST-ABANDON host lookup failed', roomId, e && e.message); return; }
-  }
-  if (!room.hostId) return;
+  const fresh = room.hostId === undefined;
+  const { hostId, status } = await resolveHostId(roomId, room, 'HOST-ABANDON');
+  if (fresh && status && status !== 'racing') return;   // already settled/closed
+  if (!hostId) return;
   const hostConnected = () => {
     for (const c of room.clients) if (c.userId === room.hostId) return true;
     return false;
@@ -2842,13 +3281,8 @@ async function maybeCloseHostAbandoned(roomId, room) {
 async function handleKickRacer(ws, room, roomId, payload) {
   const targetId = payload && payload.user_id;
   if (!targetId || !supabase) return;              // inert in TEST_MODE
-  if (room.hostId === undefined) {
-    try {
-      const { data } = await supabase.from('race_rooms').select('host_id').eq('id', roomId).single();
-      room.hostId = data ? data.host_id : null;
-    } catch (e) { log('KICK host lookup failed', roomId, e && e.message); return; }
-  }
-  if (ws.userId !== room.hostId) { log('KICK rejected (non-host)', { roomId, from: ws.userId }); return; }
+  const { hostId } = await resolveHostId(roomId, room, 'KICK');
+  if (!hostId || ws.userId !== hostId) { log('KICK rejected (non-host)', { roomId, from: ws.userId }); return; }
   room.gps.delete(targetId);                        // stop including target in the next batch
   broadcast(room, { event: 'racer_kicked', payload: { user_id: targetId } });   // to all, incl. target
   for (const c of room.clients) {                   // best-effort force-close the target socket
@@ -2892,7 +3326,7 @@ wss.on('connection', async (ws, req) => {
   const roomId = params.get('roomId');
   const userId = params.get('userId');
   const token  = params.get('token');
-  const role   = params.get('role');
+  let role     = params.get('role');   // R-250: may be downgraded to the DB role below
 
   if (!roomId || !userId || !token || (role !== 'racer' && role !== 'spectator')) {
     log('REJECT bad-params', { roomId, userId, role });
@@ -2903,8 +3337,23 @@ wss.on('connection', async (ws, req) => {
   // ── Auth: one Supabase call to validate the access token ───────────────────
   // Skipped in TEST_MODE (local simulation only) — synthetic clients have no
   // real Supabase JWT.
+  // R-250: the membership read (see SERVER_JOIN_AUTHZ) is issued in the SAME
+  // tick as getUser so authorisation costs no extra round-trip; its verdict is
+  // only consulted after the token has passed, so an unauthenticated socket
+  // still learns nothing from it. ws.member is the cached answer for the
+  // socket's lifetime ({role, lifecycle} | null = no row | undefined = read
+  // failed → treated as a member, fail-open).
   if (!TEST_MODE) {
+    let member;
     try {
+      const memberRead = Promise.all([
+        supabase.from('room_members').select('role, lifecycle').eq('room_id', roomId).eq('user_id', userId).maybeSingle(),
+        supabase.from('room_kicks').select('user_id').eq('room_id', roomId).eq('user_id', userId).maybeSingle(),
+      ]).then(([m, k]) => {
+        if (m.error || k.error) { log(`MEMBER-CHECK-ERR room=${roomId} user=${userId} err=${(m.error || k.error).message}`); return undefined; }
+        if (k.data) return null;                                   // kicked: same verdict as no row
+        return m.data ? { role: m.data.role, lifecycle: m.data.lifecycle } : null;
+      }, (e) => { log(`MEMBER-CHECK-ERR room=${roomId} user=${userId} err=${e && e.message}`); return undefined; });
       const { data, error } = await supabase.auth.getUser(token);
       if (error || !data || !data.user) {
         log('REJECT auth-failed', userId, error && error.message);
@@ -2916,10 +3365,19 @@ wss.on('connection', async (ws, req) => {
         ws.close(CLOSE_AUTH_FAILED, 'token/user mismatch');
         return;
       }
+      member = await memberRead;
     } catch (e) {
       log('REJECT auth-error', userId, e && e.message);
       ws.close(CLOSE_AUTH_FAILED, 'auth error');
       return;
+    }
+    ws.member = member;
+    if (member === null) {
+      log(`REJECT not-member room=${roomId} user=${userId} role=${role}${SERVER_JOIN_AUTHZ ? '' : ' (dry)'}`);
+      if (SERVER_JOIN_AUTHZ) { ws.close(CLOSE_NOT_MEMBER, 'not a member of this room'); return; }
+    } else if (member && role === 'racer' && member.role !== 'racer') {
+      log(`ROLE-DOWNGRADE room=${roomId} user=${userId} query=racer db=${member.role}${SERVER_JOIN_AUTHZ ? '' : ' (dry)'}`);
+      if (SERVER_JOIN_AUTHZ) role = 'spectator';
     }
   }
 
@@ -3103,7 +3561,8 @@ wss.on('connection', async (ws, req) => {
         // sibling: a racer loitering after finishing inflated raw_m 600→5797
         // and the gc flush overwrote the clean terminal row).
         if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.fx) && payload.fx.length) {
-          shadowIngest(st, payload.fx, room.meta && room.meta.activity);
+          shadowIngest(st, payload.fx, room.meta && room.meta.activity,
+                       room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0);
         }
         // R-143: step-ledger samples ride the same message. AFTER shadowIngest
         // so a segment closing on this frame sees this frame's fixes; the sx
@@ -3191,6 +3650,13 @@ wss.on('connection', async (ws, req) => {
         if (ws.lastRoomReqTs && nowReq - ws.lastRoomReqTs < ROOM_REQ_MIN_MS) return;
         ws.lastRoomReqTs = nowReq;
         if (!supabase) return;                       // TEST_MODE: no DB, nothing to serve
+        // R-250: the row (code, host, private settings) is for members only;
+        // ws.member === null is a verified non-member (a read failure is
+        // undefined and stays fail-open, exactly as at JOIN).
+        if (ws.member === null) {
+          log(`ROOM-REQ non-member room=${roomId} user=${ws.userId}${SERVER_JOIN_AUTHZ ? '' : ' (dry)'}`);
+          if (SERVER_JOIN_AUTHZ) return;
+        }
         (async () => {
           try {
             const { data: r, error } = await supabase.from('race_rooms').select('*').eq('id', roomId).single();
@@ -3223,13 +3689,8 @@ wss.on('connection', async (ws, req) => {
           const verified = VERIFIED_COMPLETE_REASONS.has(payload.reason);
           (async () => {
             if (!verified) {
-              if (room.hostId === undefined && supabase) {
-                try {
-                  const { data } = await supabase.from('race_rooms').select('host_id').eq('id', roomId).single();
-                  room.hostId = data ? data.host_id : null;
-                } catch (e) { if (room.hostId === undefined) room.hostId = null; }
-              }
-              if (!room.hostId || ws.userId !== room.hostId) {
+              const { hostId } = await resolveHostId(roomId, room, 'RACE_OVER');
+              if (!hostId || ws.userId !== hostId) {
                 log(`RACE_OVER rejected (non-host, unverified) room=${roomId} from=${ws.userId} reason=${payload && payload.reason}`);
                 return;
               }
@@ -3240,6 +3701,35 @@ wss.on('connection', async (ws, req) => {
             // complete settles through maybeCompleteRace (which delivers its own
             // terminal) instead of stalling on the rejection.
             if (verified) {
+              // A-06 / CHEAT-04: only a RACER socket may report the verified
+              // completion (the client's auto-end driver is elected from the
+              // racer roster, so an honest all_done never comes from a
+              // spectator), and the disproof below can only run against racer
+              // state this relay actually holds. With no racer state for the
+              // room beyond the sender's own — ws-backup, or the primary right
+              // after a restart, before anyone else re-JOINed — the sender
+              // resolves itself with one forged 'finished' and
+              // contradictsCompletion is vacuously null: a 200-byte frame from
+              // any signed-in user used to end the race for all 8. The blind
+              // case is not honoured and not rejected: it is redirected to
+              // maybeCompleteRace, which reads room_members + race_results and
+              // settles a genuinely complete room with its own terminal.
+              // contradictsCompletion stays a disproof, never a 'server must
+              // conclude complete' (the E-02 hang class); the cost of the
+              // redirect on an honest post-restart all_done is one
+              // COMPLETE_DEBOUNCE_MS.
+              if (ws.role !== 'racer') {
+                log(`RACE_OVER rejected (non-racer) room=${roomId} from=${ws.userId} role=${ws.role} reason=${payload.reason}`);
+                scheduleCompletionCheck(roomId, room);
+                return;
+              }
+              let othersKnown = 0;
+              for (const uid of room.racers.keys()) if (uid !== ws.userId) othersKnown++;
+              if (othersKnown === 0) {
+                log(`RACE_OVER deferred (no-state) room=${roomId} from=${ws.userId} reason=${payload.reason}`);
+                scheduleCompletionCheck(roomId, room);
+                return;
+              }
               const stillRacing = contradictsCompletion(room);
               if (stillRacing) {
                 log(`RACE_OVER rejected (contradicted) room=${roomId} from=${ws.userId} reason=${payload.reason} still_racing=${stillRacing}`);
@@ -3304,11 +3794,23 @@ wss.on('connection', async (ws, req) => {
               // frames-without-fixes is positive evidence on its own. Kept at
               // the call site (not in the pure predicate) so the harness
               // contract of finishClaimDivergent is unchanged.
+              // A-04: a state born after a restart has never seen this racer's
+              // fixes either — the same abstain as finishClaimDivergent, so a
+              // deploy mid-race can never demote an honest finisher on either
+              // trip wire (abstain-never-zero). The forgery this wire catches is
+              // now also caught at crossing time by A-01, which a restart does
+              // not reset.
               const noFixes = FINISH_CLAIM_GUARD && SERVER_AUTHORITATIVE_DISTANCE &&
                 room.meta && room.meta.targetM > 0 &&
                 (st.authN || 0) >= FINISH_CLAIM_MIN_FRAMES &&
                 (!st.shadow || (st.shadow.n || 0) === 0);
-              if (!st.claimDivergent && (finishClaimDivergent(room, st) || noFixes)) {
+              if (noFixes && creditUnknownAfterBoot(room, st)) {
+                st.credAbstain = 'credit_unknown';
+                if (!st.credAbstainLogged) {
+                  st.credAbstainLogged = true;
+                  log(`FINISH-CLAIM-ABSTAIN room=${roomId} user=${ws.userId} reason=no_server_fixes credit_unknown frames=${st.authN}`);
+                }
+              } else if (!st.claimDivergent && (finishClaimDivergent(room, st) || noFixes)) {
                 st.claimDivergent = true;
                 const tgtM = room.meta.targetM;
                 const reason = finishClaimDivergent(room, st) ? 'server_credit_low' : 'no_server_fixes';
@@ -3316,6 +3818,10 @@ wss.on('connection', async (ws, req) => {
                     `auth=${Math.round(st.authDist || 0)} target=${Math.round(tgtM)} ` +
                     `frames=${st.authN} r1=${st.authR1 || 0} reason=${reason}`);
                 flagDivergentFinish(roomId, ws.userId, st.authDist || 0, tgtM, reason);
+              } else if (st.credAbstain === 'credit_unknown' && !st.credAbstainLogged) {
+                st.credAbstainLogged = true;
+                log(`FINISH-CLAIM-ABSTAIN room=${roomId} user=${ws.userId} reason=server_credit_low credit_unknown ` +
+                    `auth=${Math.round(st.authDist || 0)} frames=${st.authN}`);
               }
             } else st.quit = true;
           }
@@ -3467,6 +3973,76 @@ const batchTimer = setInterval(() => {
 // gap_ms is measured on THIS server's clock (immune to any client freeze).
 // Terminal/evicted/quit/finished racers are included with their flags so the
 // consuming client never has to guess why someone went silent.
+// R-238: persist each live racer's ladder value (see the flag block). One UPDATE
+// per racer whose credit moved since the last write; errors are logged, never
+// fatal; nothing here awaits inside the gps path.
+// A-37: one pass of the persist writer, shared by the interval and both exit
+// paths (shutdown, uncaughtException) so a deploy or crash loses at most one
+// frame of credit instead of one interval. Returns the UPDATE promises; the
+// interval ignores them, the exit paths await them under a budget.
+function persistCreditsOnce(via) {
+  const pending = [];
+  if (!SERVER_CREDIT_PERSIST || !supabase) return pending;
+  const now = Date.now();
+  for (const [roomId, room] of rooms) {
+    if (room.terminal || !room.raceActive) continue;
+    for (const [uid, st] of room.racers) {
+      if (st.finished || st.quit || st.evicted) continue;
+      const authM = Math.round(st.authDist || 0);
+      if (!(authM > (st.persistedM || 0))) continue;
+      const sh = st.shadow || {};
+      const metaRow = { n: st.authN || 0, r1: st.authR1 || 0, seed: Math.round(sh.seedM || 0),
+                        cred: Math.round(sh.credM || 0), raw: Math.round(sh.rawM || 0),
+                        boot: BOOT_TS, ts: now, via };
+      pending.push(supabase.from('room_members')
+        .update({ server_cred_m: authM, server_cred_at: new Date(now).toISOString(), server_cred_meta: metaRow })
+        .eq('room_id', roomId).eq('user_id', uid).eq('role', 'racer')
+        .then(({ error }) => {
+          if (error) {
+            st.persistErr = (st.persistErr || 0) + 1;
+            if (st.persistErr === 1 || st.persistErr % 20 === 0) log(`CREDIT-PERSIST failed room=${roomId} user=${uid} n=${st.persistErr} err=${error.message}`);
+            return;
+          }
+          if (authM > (st.persistedM || 0)) st.persistedM = authM;
+        })
+        .catch((e) => log(`CREDIT-PERSIST error room=${roomId} user=${uid} err=${e && e.message}`)));
+    }
+  }
+  return pending;
+}
+
+const creditPersistTimer = SERVER_CREDIT_PERSIST ? setInterval(() => {
+  try {
+    persistCreditsOnce('timer');
+  } catch (e) {
+    log(`SWEEP error timer=credit-persist err=${e && e.message}`);
+    captureServer(e, { guard: 'sweep', timer: 'credit-persist' });
+  }
+}, CREDIT_PERSIST_MS) : null;
+
+// A-04 (3) / A-37: everything an exiting process still holds for a live race —
+// the v2 ledger, the replay curves and the last credit values — is flushed
+// before the sockets close. Bounded: Promise.allSettled raced against
+// budgetMs, so a wedged DB can delay an exit by at most that and never turn a
+// deploy or a crash into a hang. The flushes are idempotent (flushed flags,
+// ignoreDuplicates), so a room that later settles normally is unaffected.
+function flushLiveRoomsOnExit(via, budgetMs) {
+  const pending = [];
+  try {
+    for (const [roomId, room] of rooms) {
+      if (!room.raceActive || room.terminal) continue;
+      pending.push(...flushShadow(roomId, room, via), ...flushReplayCurves(roomId, room, via));
+    }
+    pending.push(...persistCreditsOnce(via));
+  } catch (e) { try { log(`EXIT-FLUSH error via=${via} err=${e && e.message}`); } catch (_) {} }
+  if (!pending.length) return Promise.resolve(0);
+  log(`EXIT-FLUSH via=${via} writes=${pending.length} budget=${budgetMs}ms`);
+  return Promise.race([
+    Promise.allSettled(pending).then(() => pending.length),
+    new Promise((resolve) => setTimeout(() => resolve(-1), budgetMs).unref()),
+  ]).then((n) => { log(`EXIT-FLUSH via=${via} ${n < 0 ? 'timed out' : 'done'}`); return n; });
+}
+
 const presenceTimer = setInterval(() => {
   if (!SERVER_PRESENCE) return;
   // M-3: contain a throw so one bad room can't kill every room's presence.
@@ -3667,18 +4243,29 @@ server.listen(PORT, () => {
 });
 
 // ── Graceful shutdown (Render/Oracle send SIGTERM on redeploy/stop) ──────────
+const SHUTDOWN_FLUSH_BUDGET_MS = 3000;
+const SHUTDOWN_HARD_STOP_MS    = 8000;   // was 5 s; +3 s = the flush budget
+let shuttingDown = false;
 function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   log(`${signal} received — shutting down.`);
   clearInterval(batchTimer);
   clearInterval(presenceTimer);   // R-49
+  if (creditPersistTimer) clearInterval(creditPersistTimer);   // R-238
   clearInterval(pingTimer);
   clearInterval(inactivityTimer);
   if (livekitSweepTimer) clearInterval(livekitSweepTimer);   // H-9
-  for (const ws of allClients) {
-    try { ws.close(1001, 'server shutting down'); } catch (e) {}
-  }
-  wss.close(() => server.close(() => { log('Closed. Bye.'); process.exit(0); }));
-  setTimeout(() => process.exit(0), 5000).unref(); // hard stop if not clean in 5s
+  setTimeout(() => process.exit(0), SHUTDOWN_HARD_STOP_MS).unref(); // hard stop if not clean
+  // A-04 (3): PM2 reload sends SIGINT on every deploy — flush live rooms first,
+  // then close the sockets (a socket closed before the flush would race the
+  // room_closed flush against this one for nothing; both are idempotent).
+  flushLiveRoomsOnExit('shutdown', SHUTDOWN_FLUSH_BUDGET_MS).then(() => {
+    for (const ws of allClients) {
+      try { ws.close(1001, 'server shutting down'); } catch (e) {}
+    }
+    wss.close(() => server.close(() => { log('Closed. Bye.'); process.exit(0); }));
+  });
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -3705,14 +4292,23 @@ process.on('uncaughtException', (err, origin) => {
   // short against PM2's own restart time, and it only ever applies on a crash
   // that is already fatal. Both settle paths exit 1 — a flush that fails must
   // never turn a crash into a hang.
-  if (Sentry) {
-    try {
+  // A-37: the last credit values ride the same 1500 ms window (persist only —
+  // the ledger flush is the shutdown path's job). Any throw here falls through
+  // to the immediate exit below; a crash can never become a hang.
+  const CRASH_WINDOW_MS = 1500;
+  const exit = () => process.exit(1);
+  try {
+    const persist = Promise.allSettled(persistCreditsOnce('crash'));
+    const sentry = (() => {
+      if (!Sentry) return Promise.resolve();
       Sentry.captureException(err, { tags: { origin }, level: 'fatal' });
-      Sentry.close(1500).then(() => process.exit(1), () => process.exit(1));
-      return;
-    } catch (_) {}
-  }
-  process.exit(1);
+      return Sentry.close(CRASH_WINDOW_MS);
+    })();
+    setTimeout(exit, CRASH_WINDOW_MS);   // not unref'd: the exit code must stay 1 even if the loop drains
+    Promise.allSettled([persist, sentry]).then(exit, exit);
+    return;
+  } catch (_) {}
+  exit();
 });
 process.on('unhandledRejection', (reason) => {
   // A stray rejected promise rarely corrupts global state; killing every live
