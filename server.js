@@ -698,6 +698,53 @@ const STEP_STILL_SILENT_MAX_S  = 300;   // beyond this the channel is presumed d
 // window's GPS, is tallied in meta.fuse.cv.flLeak and left for its own round).
 const SERVER_STEP_COVER_GUARD = process.env.SERVER_STEP_COVER_GUARD === '1';
 const STEP_COVER_SLACK_S      = 5;     // fix-clock vs step-clock tolerance (s)
+// ── Audit 16-Sep batch 1b: floor/carry netting + raw-stream witness (ALL DRY) ─
+// A-31 (R-290, R-225): on a device where λ calibrates (iOS) the R-143 carry /
+// R-144 blend and the R-225 cumulative floor bank the SAME step-vs-GPS
+// deficit twice — neither the floor's deficit nor its raw ceiling subtracts
+// stepM/blendUpM (12-Sep room 61746499: floor 90 + carry 27 + blend 24 on a
+// 449 m raw path → 505 auth, +8 %). Under SERVER_STEP_FLOOR_NET_CARRY the
+// floor window's GPS term becomes gps + the carry/blend metres scored inside
+// the window (flGpsNetM) and the cum ceiling subtracts the running
+// stepM + blendUpM. Unset: flGpsNetM / flDupM are computed and flushed
+// (meta.fuse.fl.netM / dupM), scoring byte-identical.
+const SERVER_STEP_FLOOR_NET_CARRY = process.env.SERVER_STEP_FLOOR_NET_CARRY === '1';
+// A-30 (A) (R-315): the K ceiling lift is keyed on ≥ 20 s of still time — the
+// FUSED pin signature. A raw-GNSS stream compressed on turns never pins
+// (13-Sep race 5461df70: stillSec 0, floor clamped to raw − cred = 15 m while
+// steps said ~800 m). Under SERVER_STEP_FLOOR_CEIL_WITNESS the lift also
+// applies once ≥ STEP_FLOOR_WIT_MIN_N floor windows were 'coherent but
+// short': walking cadence, GPS self-consistent (cred ≥ 0.85 × raw chord,
+// fixes flowing), and the step estimate ≥ 8 % above the GPS credit. The
+// deficit bound is unchanged, so a healthy phone (deficit ≈ 0) cannot move.
+const SERVER_STEP_FLOOR_CEIL_WITNESS = process.env.SERVER_STEP_FLOOR_CEIL_WITNESS === '1';
+const STEP_FLOOR_WIT_MIN_N       = 3;
+const STEP_FLOOR_WIT_CAD_MIN_SPS = 1.4;
+const STEP_FLOOR_WIT_CAD_MAX_SPS = 2.4;
+const STEP_FLOOR_WIT_SHORT_FRAC  = 0.08;   // est − gps ≥ max(5 m, this × est)
+const STEP_FLOOR_WIT_MIN_DEF_M   = 40;     // ...and the CUMULATIVE deficit ≥ max(this, 8 % of the GPS term)
+// A-30 (B) (R-314) — TELEMETRY ONLY. The card's scoring half (cadence-aware
+// height stride + straight-learned λ2 outranking it) was replay-REFUTED on
+// 16-Sep: the cadence term moved tina's stride the wrong way (1.5 sps → 0.67 m
+// vs 0.73-0.83 measured, race 2 +31 s worse than the witness alone) and the
+// straight-only λ2 came out 0.69-0.72 ≈ the height stride, no lift. What is
+// kept: λ2 learned from STRAIGHT windows only (net displacement ≥
+// STEP_LAM2_STRAIGHT_RATIO of the raw chord sum) tracked alongside the
+// production λ2 as meta.fuse.fl.lam2S / lam2SN / bent, so the next design
+// round reads the straight stride without guessing. Scoring untouched.
+const STEP_LAM2_STRAIGHT_RATIO   = 0.9;
+// A-30 (D): the Android hub delivers sx every 2 s, so R-143 segments close at
+// 10-14 s with ~20 steps < 25 and 0 of 55 are 'clean' — λ never calibrates
+// and carry/blend never run on Android (the same shape that protected the
+// realme from R-310, now guarded). Under SERVER_STEP_SX_MERGE a segment holds its
+// anchor until ≥ STEP_SX_MERGE_MIN_S AND ≥ STEP_SX_MERGE_MIN_STEPS (forced at
+// STEP_SX_MERGE_FORCE_S), so hub samples merge into calibratable segments as
+// on iOS. Ships AFTER A-31's netting so Android never inherits the double bank.
+const SERVER_STEP_SX_MERGE            = process.env.SERVER_STEP_SX_MERGE === '1';
+const STEP_SX_MERGE_MIN_S        = 20;
+const STEP_SX_MERGE_MIN_STEPS    = 25;
+const STEP_SX_MERGE_FORCE_S      = 60;
+const STEP_SX_LOG_CAP            = SERVER_STEP_SX_MERGE ? 2000 : 400;   // replay fidelity once merging is live
 const userLambda2 = new Map();          // user_id → { lam, n, src } — relay lifetime
 // ── Phase C (SHADOW_PHASE_C_DESIGN.md) — authoritative-distance ladder ───────
 // C0 = dry-run: the ladder is computed and logged on every frame but the room
@@ -1598,6 +1645,8 @@ function shadowIngest(st, fx, activity, startedAtMs) {
                               // R-225 floor rung + steps-flat gate (dry unless flagged)
                               fl: null, flM: 0, flN: 0, flSec: 0, flEstM: 0, flGpsM: 0,
                               lam2: STEP_FLOOR_LAMBDA_PRIOR, lam2N: 0, lam2Src: 'prior',
+                              // batch 1b: netting (A-31), witness (A-30 A), straight λ2 (A-30 B), merge tallies (A-30 D)
+                              flGpsNetM: 0, flDupM: 0, flWitN: 0, flBentN: 0, lam2S: STEP_FLOOR_LAMBDA_PRIOR, lam2SN: 0, sxMergeN: 0,
                               sxRing: [], stepStill: false, sxChanges: 0, ssM: 0, ssN: 0, ssMs: 0,
                               ssGateM: 0, silM: 0, silN: 0,
                               // R-144 blend accumulators + per-fix accuracy sums
@@ -1726,7 +1775,7 @@ function shadowIngestSx(st, sx, userId) {
     if (!Number.isFinite(ts) || !Number.isFinite(cum) || cum < 0) { sh.sxDrop++; continue; }
     // R-225: independent window bookkeeping — never touches the R-143 segments.
     shadowStepFloorSample(sh, ts, cum, userId);
-    if (sh.sxLog && sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
+    if (sh.sxLog && sh.sxLog.length < STEP_SX_LOG_CAP) sh.sxLog.push([ts, Math.round(cum)]);
     // A-27 / A-15: channel span + total steps (reboot-reset safe: only forward
     // deltas add) for the steps-vs-GPS advisory, and the newest ingested sample
     // time the own-row echo reports back to the client.
@@ -1752,6 +1801,8 @@ function shadowIngestSx(st, sx, userId) {
       continue;
     }
     if (T < STEP_SEG_MIN_S) continue;   // segment still accumulating; keep the anchor
+    if (SERVER_STEP_SX_MERGE && T < STEP_SX_MERGE_FORCE_S &&
+        (T < STEP_SX_MERGE_MIN_S || dS < STEP_SX_MERGE_MIN_STEPS)) { sh.sxMergeN++; continue; }   // A-30 (D)
     const snap = sh.sxSnap || shadowSxSnap(sh);
     if (T <= STEP_SEG_MAX_S) shadowSxSegment(sh, dS, T, snap, userId);
     else sh.sxDrop++;                   // absurd span — void, credit nothing
@@ -1866,9 +1917,22 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
   const clean = fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && dS >= STEP_FLOOR_WIN_MIN_STEPS &&
                 credDelta > 0 && rawDelta > 0 &&
                 credDelta >= STEP_FLOOR_CLEAN_RATIO * rawDelta && accMean <= STEP_FLOOR_CLEAN_ACC_M;
+  // A-30 (B): net displacement over the window vs the raw chord sum — a
+  // straight leg reads ≥ 0.9, a loop/turn/pin far less.
+  const netM = (snap.la != null && sh.last && Number.isFinite(sh.last.la))
+    ? haversineM(snap.la, snap.ln, sh.last.la, sh.last.ln) : 0;
+  const straight = rawDelta > 0 && netM / rawDelta >= STEP_LAM2_STRAIGHT_RATIO;
+  if (clean && !straight) sh.flBentN++;
   if (clean) {
     let ratio = credDelta / dS;
     if (ratio >= STEP_LAMBDA_MIN && ratio <= STEP_LAMBDA_MAX) {
+      // Straight-only λ2 is always tracked (telemetry); under the flag it IS λ2.
+      if (straight) {
+        let rs = ratio;
+        if (sh.lam2SN >= 5) rs = Math.min(sh.lam2S * (1 + STEP_LAMBDA_WINSOR), Math.max(sh.lam2S * (1 - STEP_LAMBDA_WINSOR), rs));
+        sh.lam2S = sh.lam2SN === 0 ? rs : sh.lam2S + STEP_LAMBDA_ALPHA * (rs - sh.lam2S);
+        sh.lam2SN++;
+      }
       if (sh.lam2N >= 5) {
         ratio = Math.min(sh.lam2 * (1 + STEP_LAMBDA_WINSOR),
                 Math.max(sh.lam2 * (1 - STEP_LAMBDA_WINSOR), ratio));
@@ -1900,6 +1964,18 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
   if (userLam != null) sh.flUserN = (sh.flUserN || 0) + 1;
   const est = Math.min(lam * dS, T * shCapMps(sh));
   const gps = credDelta + starvDelta;
+  // A-31: carry/blend metres that SCORED inside this window (R-310-skipped
+  // segments never enter stepM, so they never net); the floor's net GPS term
+  // and the metres it would otherwise have paid twice.
+  const carryDelta = Math.max(0, (sh.stepM - (snap.stepM || 0)) + (sh.blendUpM - (snap.blendUpM || 0)));
+  sh.flGpsNetM += gps + carryDelta;
+  sh.flDupM += Math.min(carryDelta, Math.max(0, est - gps));
+  // A-30 (A): 'coherent but short' — GPS tracked the walk consistently and the
+  // steps still say it fell short by ≥ 8 %.
+  if (cadence >= STEP_FLOOR_WIT_CAD_MIN_SPS && cadence <= STEP_FLOOR_WIT_CAD_MAX_SPS &&
+      fixHz >= STEP_CLEAN_MIN_FIXHZ && stillS < 5 && rawDelta > 0 &&
+      credDelta >= STEP_FLOOR_CLEAN_RATIO * rawDelta &&
+      est - gps >= Math.max(5, STEP_FLOOR_WIT_SHORT_FRAC * est)) sh.flWitN++;
   // R-225b cumulative variant: the same qualifying windows feed one running
   // deficit; shadowFloorCumM() clamps it at read time.
   sh.flEstM += est;
@@ -1916,12 +1992,28 @@ function shadowStepFloorWindow(sh, dS, T, w, userId) {
 // R-225b: cumulative floor = running step-estimate deficit over GPS credit,
 // never above the raw path (the same ceiling the window variant uses).
 function shadowFloorCumM(sh) {
+  if (SERVER_STEP_FLOOR_NET_CARRY) {
+    // A-31: the deficit nets the carry/blend metres already scored, and the
+    // raw ceiling leaves room for them too (both pools sum into authM).
+    const deficit = Math.max(0, sh.flEstM - sh.flGpsNetM);
+    const pool = (SERVER_STEP_FUSION ? sh.stepM : 0) + (SERVER_STEP_BLEND ? sh.blendUpM : 0);
+    return Math.min(deficit, Math.max(0, sh.rawM * shadowFloorCeilK(sh) - sh.credM - sh.starvM - pool));
+  }
   const deficit = Math.max(0, sh.flEstM - sh.flGpsM);
   return Math.min(deficit, Math.max(0, sh.rawM * shadowFloorCeilK(sh) - sh.credM - sh.starvM));
 }
 // R-230: raw-path ceiling factor in effect for this racer (1 = strict).
 function shadowFloorCeilK(sh) {
-  return (STEP_FLOOR_CEIL_K > 1 && sh.stillMs >= STEP_FLOOR_CEIL_STILL_S * 1000) ? STEP_FLOOR_CEIL_K : 1;
+  if (STEP_FLOOR_CEIL_K <= 1) return 1;
+  if (sh.stillMs >= STEP_FLOOR_CEIL_STILL_S * 1000) return STEP_FLOOR_CEIL_K;
+  // A-30 (A): the raw-stream witness lifts the ceiling too — ≥ 3 'coherent but
+  // short' windows AND a cumulative deficit that noise cannot reach (replay:
+  // the iPhone's 10-Sep race 98409842 tripped 3 windows on 25 m of jitter).
+  if (SERVER_STEP_FLOOR_CEIL_WITNESS && sh.flWitN >= STEP_FLOOR_WIT_MIN_N) {
+    const gpsTerm = SERVER_STEP_FLOOR_NET_CARRY ? sh.flGpsNetM : sh.flGpsM;
+    if (sh.flEstM - gpsTerm >= Math.max(STEP_FLOOR_WIT_MIN_DEF_M, STEP_FLOOR_WIT_SHORT_FRAC * gpsTerm)) return STEP_FLOOR_CEIL_K;
+  }
+  return 1;
 }
 // R-230: the floor's share cap releases on its own λ2 witness when flagged.
 function shadowFloorShare(sh) {
@@ -1938,6 +2030,7 @@ function shadowFloorScoreM(sh) {
 function shadowSxSnap(sh) {
   return { credM: sh.credM, starvM: sh.starvM, stillMs: sh.stillMs, n: sh.n,
            accSum: sh.accSum, accN: sh.accN,
+           stepM: sh.stepM, blendUpM: sh.blendUpM, rawM: sh.rawM,   // A-31 netting / A-30 (B) straightness
            coverTs: sh.seenTs,                    // R-310: newest delivered fix ts at anchor time
            la: sh.last ? sh.last.la : null, ln: sh.last ? sh.last.ln : null };
 }
@@ -2482,7 +2575,13 @@ function flushShadow(roomId, room, via) {
                             // R-231: Profile-height stride (m/step, null = no height),
                             // windows it drove, and whether it SCORED.
                             us: sh.strideUser == null ? null : sh.strideUser,
-                            usN: sh.flUserN || 0, uslive: SERVER_STEP_FLOOR_USER_STRIDE },
+                            usN: sh.flUserN || 0, uslive: SERVER_STEP_FLOOR_USER_STRIDE,
+                            // batch 1b: A-31 net GPS term + double-paid metres, A-30 witness /
+                            // bent-window counts, straight λ2, sx merges; which of them SCORE.
+                            netM: Math.round(sh.flGpsNetM), dupM: Math.round(sh.flDupM), net: SERVER_STEP_FLOOR_NET_CARRY,
+                            wit: sh.flWitN, bent: sh.flBentN, witlive: SERVER_STEP_FLOOR_CEIL_WITNESS,
+                            lam2S: Math.round(sh.lam2S * 100) / 100, lam2SN: sh.lam2SN,
+                            merge: sh.sxMergeN, mergelive: SERVER_STEP_SX_MERGE },
                       // R-225 steps-flat: metres GPS credited while steps said
                       // still (m/n/sec), metres actually forfeited by the gate
                       // (gateM), metres credited while the hub was silent (silM).
@@ -2559,6 +2658,7 @@ function flushShadow(roomId, room, via) {
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
                          ` cv=${meta.fuse.cv.m}/${meta.fuse.cv.bm}/${meta.fuse.cv.n}:${meta.fuse.cv.cal} leak=${meta.fuse.cv.flLeak}(${meta.fuse.cv.live ? 'live' : 'dry'})` +
                          ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} us=${meta.fuse.fl.us}/${meta.fuse.fl.usN}(${meta.fuse.fl.uslive ? 'live' : 'dry'}) lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
+                         ` net=${meta.fuse.fl.netM}/dup=${meta.fuse.fl.dupM}(${meta.fuse.fl.net ? 'live' : 'dry'}) wit=${meta.fuse.fl.wit}/bent=${meta.fuse.fl.bent}(${meta.fuse.fl.witlive ? 'live' : 'dry'}) lam2S=${meta.fuse.fl.lam2S}/${meta.fuse.fl.lam2SN} merge=${meta.fuse.fl.merge}(${meta.fuse.fl.mergelive ? 'live' : 'dry'})` +
                          ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '') +
             (meta.mock ? ` mock=${meta.mock.n}/${meta.mock.seen}` : '') +
             (meta.cheat && meta.cheat.verdict !== 'abstain' ? ` cheat=${meta.cheat.verdict}:${meta.cheat.gpsM}/${meta.cheat.stepsM}@${meta.cheat.cover}` : '')
