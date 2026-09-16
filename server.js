@@ -128,6 +128,19 @@ const FANOUT_EVENTS = new Set([
 const CHATTY_EVENTS = new Set(['chat', 'voice_msg', 'cheer', 'false_start']);
 const CHATTY_WINDOW_MS = 5000;
 const CHATTY_MAX_PER_WINDOW = 25;   // ~5/s sustained — far above human cadence
+// A-36 (audit 16-Sep): the cadence cap bounded COUNT only; each frame could be
+// the full 64 KiB maxPayload, relayed verbatim to up to 27 peers — 25 × 64 KiB
+// × 27 / 5 s ≈ 8.6 MB/s from one hostile socket. Bounded validation, no flag
+// (the constants are the revert): a chatty frame over the byte cap is dropped
+// (logged once per window), text fields are truncated to what the UI can even
+// show (ChatPanel maxLength 100; emoji are 2 UTF-16 units), avatar URLs must
+// look like URLs and stay short, and a spectator gets a tighter cadence than a
+// racer. Worst case falls to ~270 KB/s (racer) / ~108 KB/s (spectator).
+const CHAT_MAX_TEXT_CHARS = 200;
+const CHAT_MAX_NAME_CHARS = 40;
+const CHAT_MAX_URL_CHARS  = 512;
+const CHAT_MAX_PAYLOAD_BYTES = 2048;
+const CHATTY_MAX_PER_WINDOW_SPECTATOR = 10;
 // R-175: minimum gap between two room-row requests from one socket.
 const ROOM_REQ_MIN_MS = 1500;
 
@@ -160,13 +173,45 @@ function chattyAllowed(ws) {
     ws.chatWinStart = now;
     ws.chatCount = 0;
     ws.chatLimitLogged = false;
+    ws.chatSizeLogged = false;
   }
-  if (++ws.chatCount <= CHATTY_MAX_PER_WINDOW) return true;
+  const cap = ws.role === 'spectator' ? CHATTY_MAX_PER_WINDOW_SPECTATOR : CHATTY_MAX_PER_WINDOW;
+  if (++ws.chatCount <= cap) return true;
   if (!ws.chatLimitLogged) {
     ws.chatLimitLogged = true;
-    log(`CHATTY rate-limited user=${ws.userId} n=${ws.chatCount}`);
+    log(`CHATTY rate-limited user=${ws.userId} role=${ws.role} n=${ws.chatCount}`);
   }
   return false;
+}
+
+// A-36: bound a chatty payload in place. Returns false when the frame must be
+// dropped (over the byte cap); otherwise trims every free-text / name / URL
+// field the clients render so the fan-out cost is bounded by construction.
+// Unknown keys are left alone — the clients ignore what they do not read.
+function chattyBounded(ws, event, payload) {
+  const bytes = Buffer.byteLength(JSON.stringify(payload));
+  if (bytes > CHAT_MAX_PAYLOAD_BYTES) {
+    if (!ws.chatSizeLogged) {
+      ws.chatSizeLogged = true;
+      log(`CHATTY oversized user=${ws.userId} event=${event} bytes=${bytes}`);
+    }
+    return false;
+  }
+  const text = (v, n) => (typeof v === 'string' && v.length > n ? v.slice(0, n) : v);
+  const url  = (v) => (typeof v === 'string' && v.length <= CHAT_MAX_URL_CHARS && /^https:\/\//.test(v) ? v : null);
+  if ('text' in payload) payload.text = text(payload.text, CHAT_MAX_TEXT_CHARS);
+  if ('msg' in payload) payload.msg = text(payload.msg, CHAT_MAX_TEXT_CHARS);
+  if (payload.reply && typeof payload.reply === 'object') {
+    payload.reply.text = text(payload.reply.text, CHAT_MAX_TEXT_CHARS);
+    payload.reply.username = text(payload.reply.username, CHAT_MAX_NAME_CHARS);
+  }
+  if ('username' in payload) payload.username = text(payload.username, CHAT_MAX_NAME_CHARS);
+  if ('fromName' in payload) payload.fromName = text(payload.fromName, CHAT_MAX_NAME_CHARS);
+  if ('emoji' in payload) payload.emoji = text(payload.emoji, 8);
+  if ('receiverInitial' in payload) payload.receiverInitial = text(payload.receiverInitial, 2);
+  if ('senderAvatarUrl' in payload) payload.senderAvatarUrl = url(payload.senderAvatarUrl);
+  if ('recvAvatarUrl' in payload) payload.recvAvatarUrl = url(payload.recvAvatarUrl);
+  return true;
 }
 
 const BATCH_INTERVAL_MS = 1000;   // GPS fan-out cadence
@@ -746,6 +791,34 @@ const SERVER_JOIN_AUTHZ        = process.env.SERVER_JOIN_AUTHZ === '1';
 // of the room object. A miss now leaves it undefined and is retried after this
 // negative TTL; a genuine NULL host_id (delete-account) is still cached as such.
 const HOST_ID_MISS_TTL_MS      = 2000;
+// ── A-26 / R-251 relay half: a socket-less racer may be alive on the OTHER relay
+// (primary↔backup fork on a 3 s probe) or on the HTTPS fallback. Before this
+// relay resolves them as 'gone ≥ 90 s' in maybeCompleteRace, or lets the
+// eviction clock run, it reads what the DB says moved since the socket dropped:
+// room_members.server_cred_at (written only by a relay) or last_distance_m
+// (the client mirror, liveness only — never credit, A-08). Either newer than
+// disconnectedAt = alive elsewhere → keep unresolved / stand the clock down.
+// SERVER_GONE_LIVENESS_CHECK=1 enforces; unset logs GONE-LIVE-ELSEWHERE (dry).
+const SERVER_GONE_LIVENESS_CHECK = process.env.SERVER_GONE_LIVENESS_CHECK === '1';
+// ── A-27 relay half: mock bit on the wire + steps-vs-GPS advisory ───────────
+// fx rows may carry three optional trailing columns, defined ONCE for every
+// producer (raw drain, fused push, native ring): [ts, lat, lon, acc, spd, brg,
+// prov, mock] — brg = bearing deg (null/-1 = none), prov = 'r' raw | 'f' fused,
+// mock = 1 when the platform flagged the fix as simulated. Today's clients
+// send five columns; the tallies below are simply zero for them. At flush the
+// relay compares GPS credit with what the step channel could physically
+// cover: gpsM = credM + starvM vs stepsM = STEP_LAMBDA_MAX × steps. A verdict
+// of 'gps_exceeds_steps' needs gpsM > CHEAT_GPS_STEPS_RATIO × stepsM +
+// CHEAT_GPS_STEPS_SLACK_M, the sx channel covering ≥ CHEAT_SX_COVER_MIN of the
+// race, and a foot sport — else ABSTAIN (no step channel = races normally).
+// Telemetry only (meta.mock / meta.cheat, CHEAT-ADVISORY) unless
+// SERVER_CHEAT_FLAG=1, which additionally stamps the advisory token on the
+// row (not an enforced token: stats unaffected). Demotion is a later DDL.
+const SERVER_CHEAT_FLAG        = process.env.SERVER_CHEAT_FLAG === '1';
+const CHEAT_GPS_STEPS_RATIO    = 1.3;
+const CHEAT_GPS_STEPS_SLACK_M  = 100;
+const CHEAT_SX_COVER_MIN       = 0.7;
+const MOCK_LOCATION_MIN_FIXES  = 3;
 // ── R-168 rung-2 gap bound ───────────────────────────────────────────────────
 // 2026-09-05 race 27e4041f: a racer walked a 30 m box for 10 min, rung 1 had
 // credited 23 m (every segment below the stillness gate), then ONE rung-2 frame
@@ -1560,9 +1633,17 @@ function shadowIngest(st, fx, activity, startedAtMs) {
   for (const f of list) {
     if (sh.n >= SHADOW_MAX_FIXES) { sh.over++; continue; }
     if (!Array.isArray(f) || f.length < 4) { sh.drop.bad++; continue; }
-    const [t, la, ln, ac, spd] = f;
+    const [t, la, ln, ac, spd, brg, prov, mock] = f;
     if (!Number.isFinite(t) || !Number.isFinite(la) || !Number.isFinite(ln) ||
         la < -90 || la > 90 || ln < -180 || ln > 180) { sh.drop.bad++; continue; }
+    // A-27: optional trailing columns (see the flag block). Tallied before any
+    // gate so a spoofed fix that the accuracy gate drops still counts as seen.
+    if (f.length > 5) {
+      sh.extN = (sh.extN || 0) + 1;
+      if (prov === 'r') sh.provR = (sh.provR || 0) + 1;
+      else if (prov === 'f') sh.provF = (sh.provF || 0) + 1;
+      if (mock === 1 || mock === true) { sh.mockN = (sh.mockN || 0) + 1; }
+    }
     // A-07 (3): a fix stamped before the race (minus slack) or after the relay's
     // own clock (plus slack) is a replayed or pre-dated track. Counted always
     // (meta.auth.skew, AUTH-DELTA skew=); dropped only under SERVER_CREDIT_FX_SKEW.
@@ -1579,9 +1660,18 @@ function shadowIngest(st, fx, activity, startedAtMs) {
     // Rounding keeps a 14400-fix worst case ~600 KB of jsonb; 6 decimals is
     // ~0.1 m, below anything the gates can resolve.
     if (SHADOW_PERSIST_FIXES && sh.fx) {
-      sh.fx.push([t, +la.toFixed(6), +ln.toFixed(6),
-                  Number.isFinite(ac) ? +ac.toFixed(1) : null,
-                  Number.isFinite(spd) ? +spd.toFixed(2) : null]);
+      const row = [t, +la.toFixed(6), +ln.toFixed(6),
+                   Number.isFinite(ac) ? +ac.toFixed(1) : null,
+                   Number.isFinite(spd) ? +spd.toFixed(2) : null];
+      // A-27: the trailing columns ride along when a client sends them, so an
+      // offline replay can see provider / mock per fix. Five-column rows stay
+      // five columns — every existing export and rig reads indexes 0-4 only.
+      if (f.length > 5) {
+        row.push(Number.isFinite(brg) && brg >= 0 ? Math.round(brg) : null,
+                 prov === 'r' || prov === 'f' ? prov : null,
+                 (mock === 1 || mock === true) ? 1 : 0);
+      }
+      sh.fx.push(row);
     }
     if (Number.isFinite(ac) && ac > SHADOW_MAX_ACC_M) { sh.drop.acc++; continue; }
     // R-144: per-accepted-fix accuracy sum — segment diffs give the blend its
@@ -1637,6 +1727,13 @@ function shadowIngestSx(st, sx, userId) {
     // R-225: independent window bookkeeping — never touches the R-143 segments.
     shadowStepFloorSample(sh, ts, cum, userId);
     if (sh.sxLog && sh.sxLog.length < 400) sh.sxLog.push([ts, Math.round(cum)]);
+    // A-27 / A-15: channel span + total steps (reboot-reset safe: only forward
+    // deltas add) for the steps-vs-GPS advisory, and the newest ingested sample
+    // time the own-row echo reports back to the client.
+    if (!sh.sxFirstTs) sh.sxFirstTs = ts;
+    if (ts > (sh.sxNewestTs || 0)) sh.sxNewestTs = ts;
+    if (sh.sxPrevCum != null && cum > sh.sxPrevCum) sh.sxTotalSteps = (sh.sxTotalSteps || 0) + (cum - sh.sxPrevCum);
+    sh.sxPrevCum = cum;
     if (!sh.sxLast) {
       // First sample anchors the first segment: snapshot the GPS accumulators
       // so the next sample can read this segment's deltas.
@@ -2265,6 +2362,44 @@ function flagDivergentFinish(roomId, userId, authM, targetM, reason = 'server_cr
     }, (e) => { log('FINISH-DIVERGENT demote rpc threw', roomId, userId, e && e.message); flagOnly(); });
 }
 
+// A-27: steps-vs-GPS advisory at flush (see the flag block). Pure over the
+// accumulator; null when there is nothing to say (no fixes), 'abstain' when the
+// evidence is not admissible, otherwise the verdict with its inputs.
+function shadowCheatAdvisory(room, st, sh) {
+  if (!sh || !sh.n) return null;
+  const fin = sh.finSnap;
+  const gpsM = Math.round((fin ? fin.credM + fin.starvM : sh.credM + sh.starvM) || 0);
+  const steps = sh.sxTotalSteps || 0;
+  const stepsM = Math.round(STEP_LAMBDA_MAX * steps);
+  const startedAt = room && room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0;
+  const endTs = (fin && fin.ts) || sh.lastTs || 0;
+  const raceMs = startedAt && endTs > startedAt ? endTs - startedAt : 0;
+  const spanMs = sh.sxFirstTs && sh.sxNewestTs ? Math.max(0, sh.sxNewestTs - sh.sxFirstTs) : 0;
+  const cover = raceMs > 0 ? Math.round(Math.min(1, spanMs / raceMs) * 100) / 100 : 0;
+  const footSport = !!sh.act && STEP_FLOOR_ACTIVITIES.has(sh.act);
+  const out = { gpsM, stepsM, steps, cover, mock: sh.mockN || 0, verdict: 'abstain', live: SERVER_CHEAT_FLAG };
+  if (!footSport || cover < CHEAT_SX_COVER_MIN || !raceMs) return out;
+  if (gpsM > CHEAT_GPS_STEPS_RATIO * stepsM + CHEAT_GPS_STEPS_SLACK_M) out.verdict = 'gps_exceeds_steps';
+  else out.verdict = 'ok';
+  return out;
+}
+
+// A-27: stamp an ADVISORY token on the racer's row — first-flag-wins (the
+// integrity trigger keeps an existing verdict), fire-and-forget, never enforced
+// by flag_is_enforced, so stats and rank are untouched. Only under the flag.
+function flagRowAdvisory(roomId, userId, reason) {
+  if (!supabase) return;
+  supabase.from('race_results')
+    .update({ flagged: true, flag_reason: reason })
+    .eq('room_id', roomId).eq('user_id', userId)
+    .or('flagged.is.null,flagged.eq.false')
+    .select('id')
+    .then(({ data, error }) => {
+      if (error) { log('CHEAT-ADVISORY flag write failed', roomId, userId, error.message); return; }
+      if (data && data.length) log(`CHEAT-ADVISORY-FLAGGED room=${roomId} user=${userId} reason=${reason}`);
+    }, (e) => log('CHEAT-ADVISORY flag write threw', roomId, userId, e && e.message));
+}
+
 // Persist every racer's shadow tally once. Multiple hooks may race (terminal
 // settle, ROOM CLOSED, GC) — the per-racer flag plus the table's PK upsert make
 // that harmless. Fire-and-forget: shadow must never delay teardown paths.
@@ -2394,6 +2529,19 @@ function flushShadow(roomId, room, via) {
         if (st.credSeedDbM) meta.auth.seedDbM = Math.round(st.credSeedDbM);
         if (st.credAbstain) meta.auth.abstain = st.credAbstain;
       }
+      // A-27: wire-extension tallies (absent for a five-column client) and the
+      // steps-vs-GPS advisory. The advisory abstains without a step channel
+      // that covered most of the race, or on a non-foot sport.
+      if (sh.extN) meta.mock = { n: sh.mockN || 0, seen: sh.extN, r: sh.provR || 0, f: sh.provF || 0 };
+      const cheat = shadowCheatAdvisory(room, st, sh);
+      if (cheat) {
+        meta.cheat = cheat;
+        if (cheat.verdict !== 'abstain') {
+          log(`CHEAT-ADVISORY room=${roomId} user=${userId} verdict=${cheat.verdict} gps=${cheat.gpsM} steps=${cheat.stepsM} ` +
+              `cover=${cheat.cover} mock=${sh.mockN || 0}${SERVER_CHEAT_FLAG ? '' : ' (dry)'}`);
+          if (SERVER_CHEAT_FLAG) flagRowAdvisory(roomId, userId, cheat.verdict);
+        }
+      }
     }
     const row = {
       room_id: roomId, user_id: userId,
@@ -2411,7 +2559,9 @@ function flushShadow(roomId, room, via) {
                          ` blend=+${meta.fuse.up}/-${meta.fuse.dn}(${meta.fuse.blive ? 'live' : 'dry'})` +
                          ` cv=${meta.fuse.cv.m}/${meta.fuse.cv.bm}/${meta.fuse.cv.n}:${meta.fuse.cv.cal} leak=${meta.fuse.cv.flLeak}(${meta.fuse.cv.live ? 'live' : 'dry'})` +
                          ` fl=${meta.fuse.fl.m}/${meta.fuse.fl.n} cum=${meta.fuse.fl.cumM}(${meta.fuse.fl.estM}-${meta.fuse.fl.gpsM}):${meta.fuse.fl.mode} shr=${meta.fuse.fl.shr} ck=${meta.fuse.fl.ck} us=${meta.fuse.fl.us}/${meta.fuse.fl.usN}(${meta.fuse.fl.uslive ? 'live' : 'dry'}) lam2=${meta.fuse.fl.lam2}/${meta.fuse.fl.lam2N}:${meta.fuse.fl.src}(${meta.fuse.fl.live ? 'live' : 'dry'})` +
-                         ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '')
+                         ` ss=${meta.fuse.ss.m}/${meta.fuse.ss.sec}s sil=${meta.fuse.ss.silM}(${meta.fuse.ss.live ? 'live' : 'dry'})` : '') +
+            (meta.mock ? ` mock=${meta.mock.n}/${meta.mock.seen}` : '') +
+            (meta.cheat && meta.cheat.verdict !== 'abstain' ? ` cheat=${meta.cheat.verdict}:${meta.cheat.gpsM}/${meta.cheat.stepsM}@${meta.cheat.cover}` : '')
           : ''));
     // ignoreDuplicates: first successful flush wins (terminal fires before
     // room_closed/gc), so a late flush can never overwrite the canonical row.
@@ -2561,9 +2711,24 @@ async function evictRacer(roomId, room, userId, reason) {
   st.evicting = true;
   try {
     const { data: m, error: mErr } = await supabase.from('room_members')
-      .select('last_distance_m, lifecycle').eq('room_id', roomId).eq('user_id', userId)
+      .select('last_distance_m, lifecycle, server_cred_at').eq('room_id', roomId).eq('user_id', userId)
       .eq('role', 'racer').maybeSingle();
     if (mErr) { log('EVICT member read failed', roomId, userId, mErr.message); return; }
+    // A-26: a relay-written credit stamp newer than this socket's drop means the
+    // racer is scoring on the OTHER relay — the disconnect clock must not run
+    // against them here (the stand-down below covers the client mirror).
+    if (m && m.server_cred_at && st.disconnectedAt) {
+      const credAt = new Date(m.server_cred_at).getTime();
+      if (credAt > st.disconnectedAt && credAt > (st.credElsewhereAt || 0)) {
+        log(`EVICT stand-down (live elsewhere) room=${roomId} user=${userId} cred_at=${m.server_cred_at} reason=${reason}${SERVER_GONE_LIVENESS_CHECK ? '' : ' (dry)'}`);
+        if (SERVER_GONE_LIVENESS_CHECK) {
+          st.credElsewhereAt = credAt;
+          st.lastMoveTs = Date.now(); st.warnDeadline = 0;
+          st.disconnectedAt = Date.now();   // still gone from THIS relay: restart the 10-min clock
+          return;
+        }
+      }
+    }
     if (!m) { st.quit = true; scheduleCompletionCheck(roomId, room); return; } // row gone → already quit/kicked
     // P2: row absence is no longer the only "already resolved" signal — P1.5 keeps
     // the row while the room is racing. The in-memory guard at the top of this
@@ -3093,7 +3258,9 @@ async function maybeCompleteRace(roomId, room) {
   room.completing = true;
   try {
     const [{ data: rawMembers, error: mErr }, { data: results, error: rErr }] = await Promise.all([
-      supabase.from('room_members').select('user_id, lifecycle').eq('room_id', roomId).eq('role', 'racer'),
+      // A-26: server_cred_at / last_distance_m ride the same read (no extra
+      // round-trip) so the gone-window below can see a racer alive elsewhere.
+      supabase.from('room_members').select('user_id, lifecycle, server_cred_at, last_distance_m').eq('room_id', roomId).eq('role', 'racer'),
       supabase.from('race_results').select('user_id, finish_position, finish_time_ms, distance_covered_m').eq('room_id', roomId),
     ]);
     // P2: drop ONLY the terminal-with-row states. 'finished' deliberately STAYS in
@@ -3150,7 +3317,7 @@ async function maybeCompleteRace(roomId, room) {
       r.finish_position == null && r.finish_time_ms != null &&
       metaTargetM > 0 && (r.distance_covered_m || 0) >= metaTargetM);
     const now = Date.now();
-    const unresolved = members.filter(({ user_id }) => {
+    const unresolved = members.filter(({ user_id, server_cred_at, last_distance_m }) => {
       if (settled.has(user_id)) return false;
       // The 90s-gone shortcut only applies when a COMPLETER is waiting on the
       // straggler (client-parity: only a present finisher/driver ever completed
@@ -3170,7 +3337,24 @@ async function maybeCompleteRace(roomId, room) {
         const dist = Math.max(room.gps.get(user_id)?.distance_m || 0, st.lastDist || 0);
         if (targetM > 0 && dist >= targetM) return false;
       }
-      return !(st && !st.connected && st.disconnectedAt && now - st.disconnectedAt >= SERVER_GONE_GRACE_MS);
+      const goneHere = !!(st && !st.connected && st.disconnectedAt && now - st.disconnectedAt >= SERVER_GONE_GRACE_MS);
+      if (!goneHere) return true;
+      // A-26: 'gone' is this relay's transport record only. A racer forked onto
+      // the other relay (or alive on the HTTPS fallback) keeps writing the DB:
+      // a relay-written server_cred_at after the drop, or a client mirror that
+      // advanced past what this socket last saw, means they are still racing.
+      const credAt = server_cred_at ? new Date(server_cred_at).getTime() : 0;
+      const mirrorMoved = (last_distance_m || 0) > (st.lastDist || 0) + EVICT_PROGRESS_EPS_M;
+      if (credAt > st.disconnectedAt || mirrorMoved) {
+        if (!st.goneLiveLogTs || now - st.goneLiveLogTs >= 60000) {
+          st.goneLiveLogTs = now;
+          log(`GONE-LIVE-ELSEWHERE room=${roomId} user=${user_id} gone=${Math.round((now - st.disconnectedAt) / 1000)}s ` +
+              `cred_at=${credAt ? new Date(credAt).toISOString() : '-'} mirror=${last_distance_m || 0}/${Math.round(st.lastDist || 0)}` +
+              `${SERVER_GONE_LIVENESS_CHECK ? '' : ' (dry)'}`);
+        }
+        if (SERVER_GONE_LIVENESS_CHECK) return true;   // still unresolved: not gone
+      }
+      return false;
     });
     if (unresolved.length) return;
     // Distinguish the zero-finisher-gap path in the log: an EMPTY `members` means
@@ -3589,6 +3773,11 @@ wss.on('connection', async (ws, req) => {
           distance_m: dispM,
           speed_kmh: Number.isFinite(payload.speed_kmh) ? payload.speed_kmh : null,
           ts: Number.isFinite(payload.ts) && payload.ts > 0 ? payload.ts : Date.now(),
+          // A-15: ack cursors — the newest fx / sx timestamps this relay has
+          // INGESTED from this racer. The client compares them with what it
+          // sent and resends the tail on reconnect (send() is not delivery).
+          // Additive; old clients ignore unknown fields on their own row.
+          ...(st && st.shadow ? { fxSeen: st.shadow.seenTs || 0, sxSeen: st.shadow.sxNewestTs || 0 } : {}),
         });
         room.dirty = true;
         // First gps marks the race live and seeds the movement clock.
@@ -3674,6 +3863,8 @@ wss.on('connection', async (ws, req) => {
       if (FANOUT_EVENTS.has(event)) {
         // R-154(d): drop over-cadence chat/cheer spam before it costs a fan-out.
         if (CHATTY_EVENTS.has(event) && !chattyAllowed(ws)) return;
+        // A-36: bound the bytes and the rendered fields before the fan-out.
+        if (CHATTY_EVENTS.has(event) && !chattyBounded(ws, event, payload)) return;
         // Terminal event: reliable fan-out (ack + bounded retry) instead of a
         // fire-and-forget relay — the sender navigates away and drops its socket
         // immediately, but survivors must still end their HUD.
