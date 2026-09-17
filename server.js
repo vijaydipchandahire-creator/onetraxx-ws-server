@@ -469,6 +469,19 @@ const SHADOW_RESET_GAP_MS    = 30000;
 // SCORE (rung 1 becomes seedM + min(credM + starvM, rawM)). Default 0 = dry
 // run: read the would-be credit off telemetry before any result depends on it.
 const SERVER_STARVATION_LADDER = process.env.SERVER_STARVATION_LADDER === '1';
+// ── R-342 seed cover guard (DRY-RUN by default) ─────────────────────────────
+// 17-Sep race c4fe3cb9: a phone locked at GO joined the relay 15 s late and its
+// first frame carried the client's claim but no fx yet (the raw-GNSS drain is
+// async) → rung 2 set authDist=18 → the accumulator born on the NEXT frame
+// seeded itself with those 18 m, then credited the buffered fixes that reached
+// back to GO+1 s: the same 30 s paid twice, and a 40 s finish lead. The seed
+// exists for an accumulator whose fixes DON'T cover the gap (restart, rejoin);
+// when the first ingested fix lies within SLACK of race start the fixes cover
+// the race and the seed is a double count. Persisted-credit hydration (R-238,
+// credSeedDbM) is untouched — that credit covers fixes this process never saw.
+// Unset = tally + `SEED-COVER-DRY` only; =1 → seedM stays 0 (`SEED-COVER-SKIP`).
+const SERVER_SHADOW_SEED_COVER  = process.env.SERVER_SHADOW_SEED_COVER === '1';
+const SHADOW_SEED_COVER_SLACK_MS = 10000;
 // ── R-143 step-displacement fusion (DRY-RUN by default) ──────────────────────
 // The pocket-race residual: two same-pocket phones diverge 40-70% because one
 // stops OBSERVING the walk — battery-managed delivery starvation (room e0f2ac3b:
@@ -931,6 +944,12 @@ const DISPLAY_FINISH_HOLD_M = 3;   // held short of target until the real crossi
 // client's own-avatar taper (HUD_FINISH_TAPER_K) so both ends converge alike.
 const SERVER_FINISH_TAPER = process.env.SERVER_FINISH_TAPER !== '0';   // kill switch
 const DISPLAY_TAPER_K = 0.4;
+// R-343: a claim the budget had to trim is not a number to lead toward — once
+// a racer's frame has been BUDGET-TRIMmed the fan-out shows pure auth (17-Sep
+// c4fe3cb9: a fused-provider balloon to 490 m unlocked the full 50 m lead on
+// every HUD on top of a real 49 m lead — the visible "jump"). Unset = tally
+// only (meta.auth.dispTrim); =1 → no lead after a trim.
+const SERVER_DISPLAY_TRIM_HOLD = process.env.SERVER_DISPLAY_TRIM_HOLD === '1';
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
@@ -1626,7 +1645,7 @@ function shadowV2Step(sh, t, la, ln, ac, spd) {
 function shCapMps(sh)  { return (sh && sh.capMps)  || SHADOW_MAX_CREDIT_MPS; }
 function shTeleMps(sh) { return (sh && sh.teleMps) || SHADOW_TELEPORT_MPS; }
 
-function shadowIngest(st, fx, activity, startedAtMs) {
+function shadowIngest(st, fx, activity, startedAtMs, userId) {
   let sh = st.shadow;
   if (!sh) sh = st.shadow = { last: null, rawM: 0, credM: 0, n: 0, firstTs: 0, lastTs: 0,
                               drop: { acc: 0, order: 0, tele: 0, bad: 0 }, over: 0, flushed: false,
@@ -1659,7 +1678,20 @@ function shadowIngest(st, fx, activity, startedAtMs) {
   // Phase C seedM: a racer whose accumulator is born mid-race (relay restart,
   // rejoin) already holds credit — fold it in once at creation, exactly as
   // budgetedDistance seeds from baselineDist. Zero on a normal race start.
-  if (sh.n === 0) sh.seedM = Math.max(st.authDist || 0, st.baselineDist || 0);
+  if (sh.n === 0) {
+    sh.seedM = Math.max(st.authDist || 0, st.baselineDist || 0);
+    // R-342: fixes that reach back to race start cover the race — the seed
+    // would pay the same span twice. Persisted credit (credSeedDbM) keeps it.
+    if (sh.seedM > 0 && startedAtMs > 0 && st.credSeedDbM == null) {
+      let firstFxTs = 0;
+      for (const f of fx) if (Array.isArray(f) && Number.isFinite(f[0]) && f[0] > 0 && (!firstFxTs || f[0] < firstFxTs)) firstFxTs = f[0];
+      if (firstFxTs && firstFxTs - startedAtMs <= SHADOW_SEED_COVER_SLACK_MS) {
+        sh.seedCover = { seed: Math.round(sh.seedM), firstFxS: Math.round((firstFxTs - startedAtMs) / 1000), live: SERVER_SHADOW_SEED_COVER };
+        log(`SEED-COVER-${SERVER_SHADOW_SEED_COVER ? 'SKIP' : 'DRY'} user=${userId || '?'} seed=${sh.seedCover.seed} firstFx=+${sh.seedCover.firstFxS}s`);
+        if (SERVER_SHADOW_SEED_COVER) sh.seedM = 0;
+      }
+    }
+  }
   // Finish snapshot: devices stream fixes for minutes after finishing, so the
   // flushed cred_m includes post-finish walking (22-Aug read: +43–60% "over-
   // credit" that was really cooldown meters). Freeze the race-portion numbers
@@ -2348,6 +2380,11 @@ function displayDistance(room, st, authM) {
   if (!SERVER_DISPLAY_BLEND || !SERVER_AUTHORITATIVE_DISTANCE) return authM;
   const budgetM = st && st.budgetDist;
   if (!(budgetM > authM)) return authM;                      // auth leads or equal: truth wins
+  // R-343: a trimmed claim forfeits the lead (tally when dry).
+  if (st.trimmed > 0) {
+    st.dispTrimN = (st.dispTrimN || 0) + 1;
+    if (SERVER_DISPLAY_TRIM_HOLD) return authM;
+  }
   let d = Math.max(authM, Math.min(budgetM, authM + DISPLAY_LEAD_M));
   const targetM = room && room.meta && room.meta.targetM;
   // Never show the line crossed before the server witnesses it: while auth is
@@ -2626,6 +2663,8 @@ function flushShadow(roomId, room, via) {
         if (st.r2Cap) meta.auth.r2cap = { held: st.r2CapHeldM || 0, n: st.r2Cap, live: SERVER_CREDIT_SCORE_CAPS };
         if (sh.skewN) meta.auth.skew = { n: sh.skewN, live: SERVER_CREDIT_FX_SKEW };
         if (st.credSeedDbM) meta.auth.seedDbM = Math.round(st.credSeedDbM);
+        if (sh.seedCover) meta.auth.seedCover = sh.seedCover;
+        if (st.dispTrimN) meta.auth.dispTrim = { n: st.dispTrimN, live: SERVER_DISPLAY_TRIM_HOLD };
         if (st.credAbstain) meta.auth.abstain = st.credAbstain;
       }
       // A-27: wire-extension tallies (absent for a five-column client) and the
@@ -2638,7 +2677,10 @@ function flushShadow(roomId, room, via) {
         if (cheat.verdict !== 'abstain') {
           log(`CHEAT-ADVISORY room=${roomId} user=${userId} verdict=${cheat.verdict} gps=${cheat.gpsM} steps=${cheat.stepsM} ` +
               `cover=${cheat.cover} mock=${sh.mockN || 0}${SERVER_CHEAT_FLAG ? '' : ' (dry)'}`);
-          if (SERVER_CHEAT_FLAG) flagRowAdvisory(roomId, userId, cheat.verdict);
+          // R-341: only an adverse verdict is a flag. 'ok' is the honest
+          // outcome and was stamped too (17-Sep: every running finisher saw
+          // "flagged for review" on a clean race).
+          if (SERVER_CHEAT_FLAG && cheat.verdict === 'gps_exceeds_steps') flagRowAdvisory(roomId, userId, cheat.verdict);
         }
       }
     }
@@ -3846,7 +3888,7 @@ wss.on('connection', async (ws, req) => {
         // and the gc flush overwrote the clean terminal row).
         if (SERVER_SHADOW_DISTANCE && st && !room.terminal && Array.isArray(payload.fx) && payload.fx.length) {
           shadowIngest(st, payload.fx, room.meta && room.meta.activity,
-                       room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0);
+                       room.meta && room.meta.startedAt ? new Date(room.meta.startedAt).getTime() : 0, ws.userId);
         }
         // R-143: step-ledger samples ride the same message. AFTER shadowIngest
         // so a segment closing on this frame sees this frame's fixes; the sx
