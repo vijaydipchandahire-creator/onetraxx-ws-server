@@ -950,6 +950,16 @@ const DISPLAY_TAPER_K = 0.4;
 // every HUD on top of a real 49 m lead — the visible "jump"). Unset = tally
 // only (meta.auth.dispTrim); =1 → no lead after a trim.
 const SERVER_DISPLAY_TRIM_HOLD = process.env.SERVER_DISPLAY_TRIM_HOLD === '1';
+// R-349: the display lead may run ahead of verified credit only by the metres
+// the racer's OWN raw track holds that the gates withheld (rawM − credited GPS
+// metres). That is the exact quantity the blend exists to hide (c200d981: the
+// still-clamp lag — raw HAD the metres). A client claim the relay never saw in
+// any stream (20-Sep 663033: the realme's fused-provider credit ran 33–55 m
+// ahead of its raw-GNSS fx for 7 min, so every HUD and the replay drew a 62 m
+// 'jump' at 15 s while auth read 19 m) is excluded by construction. Applies
+// only while fixes are fresh (rung 1) — stale = today's blend, unchanged.
+// Fan-out + replay only; scoring untouched. Unset = tally (meta.auth.dispRawCap).
+const SERVER_DISPLAY_RAW_CAP = process.env.SERVER_DISPLAY_RAW_CAP === '1';
 
 // Persist the raw fix stream (race_shadow_fixes, service-role only) so v2 gate
 // constants can be tuned offline against REAL device traces — the synthetic
@@ -2340,6 +2350,7 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
   if (targetM > 0) authM = Math.min(authM, targetM);
   st.authDist = authM;
   st.budgetDist = budgetM;   // display blend reads this; never used for scoring
+  st.fxFresh = fxFresh;      // R-349: display raw-cap applies on rung 1 only
   st.authN = (st.authN || 0) + 1;
   if (fxFresh) {
     st.authR1 = (st.authR1 || 0) + 1;
@@ -2367,6 +2378,7 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         (st.r2Bound ? ` r2hold=${st.r2HeldM}/${st.r2Bound}${R168_RUNG2_GAP_BOUND ? '(live)' : '(off)'}` : '') +
         (st.r2Cap ? ` r2cap=${st.r2CapHeldM}/${st.r2Cap}${SERVER_CREDIT_SCORE_CAPS ? '(live)' : '(dry)'}` : '') +
         (st.scoreBound ? ` score=${st.scoreHeldM}/${st.scoreBound}(dry)` : '') +
+        (st.dispRawCapN ? ` dispcap=${st.dispRawCapM}/${st.dispRawCapN}${SERVER_DISPLAY_RAW_CAP ? '(live)' : '(dry)'}` : '') +
         (sh && sh.skewN ? ` skew=${sh.skewN}${SERVER_CREDIT_FX_SKEW ? '(live)' : '(dry)'}` : ''));
   }
   return SERVER_AUTHORITATIVE_DISTANCE ? authM : budgetM;
@@ -2386,6 +2398,19 @@ function displayDistance(room, st, authM) {
     if (SERVER_DISPLAY_TRIM_HOLD) return authM;
   }
   let d = Math.max(authM, Math.min(budgetM, authM + DISPLAY_LEAD_M));
+  // R-349: lead ≤ the raw-path surplus the gates withheld (see the flag block).
+  // Identity without a ledger, before the first fix, or on rung 2.
+  const sh = st.shadow;
+  if (sh && st.fxFresh && sh.n > 0 && Number.isFinite(sh.rawM)) {
+    const starvM = SERVER_STARVATION_LADDER ? (sh.starvM || 0) : 0;
+    const gpsM = Math.min((sh.credM || 0) + starvM, sh.rawM);
+    const capM = authM + Math.max(0, sh.rawM - gpsM);
+    if (d > capM + 0.5) {
+      st.dispRawCapN = (st.dispRawCapN || 0) + 1;
+      st.dispRawCapM = Math.round((st.dispRawCapM || 0) + (d - capM));
+      if (SERVER_DISPLAY_RAW_CAP) d = capM;
+    }
+  }
   const targetM = room && room.meta && room.meta.targetM;
   // Never show the line crossed before the server witnesses it: while auth is
   // short of target the display parks just under it, and the moment the real
@@ -2665,6 +2690,7 @@ function flushShadow(roomId, room, via) {
         if (st.credSeedDbM) meta.auth.seedDbM = Math.round(st.credSeedDbM);
         if (sh.seedCover) meta.auth.seedCover = sh.seedCover;
         if (st.dispTrimN) meta.auth.dispTrim = { n: st.dispTrimN, live: SERVER_DISPLAY_TRIM_HOLD };
+        if (st.dispRawCapN) meta.auth.dispRawCap = { n: st.dispRawCapN, m: st.dispRawCapM || 0, live: SERVER_DISPLAY_RAW_CAP };
         if (st.credAbstain) meta.auth.abstain = st.credAbstain;
       }
       // A-27: wire-extension tallies (absent for a five-column client) and the
