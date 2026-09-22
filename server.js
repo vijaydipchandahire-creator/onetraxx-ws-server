@@ -553,6 +553,21 @@ const STEP_BLEND_W_BASE    = 0.40;  // steps' weight in a fully healthy segment
                                     // LOOKS healthy, the observed failure shape)
 const STEP_BLEND_W_MAX     = 0.90;  // ...and in a fully degraded one
 const STEP_TRIM_SHARE      = 0.25;  // blend-down ≤ this share of the base score
+// R-351 (22-Sep one-pocket races 497093/819419): iOS ships one pedometer sample
+// per ~21 s (CMPedometer window query, R-143 cap), so EVERY iOS blend segment is
+// ~21 s long and its step delta is lumpy (22/38/44 steps per segment for a steady
+// walker) while the GPS credit in the same segment is steady. The lean segments
+// trim (−1..−8 m each), the fat ones' ups are share-capped → net −17 m per race,
+// iOS-only (Android sx lands every 0.5-2 s: no segment reaches STEP_MOVE_MIN_STEPS,
+// zero blend segments on both Android phones). This gate skips the DOWN trim on
+// segments longer than N s; ups, λ, floor, carry and the cover guard are untouched.
+// Unset/0 = byte-identical to today (the long-segment trims are still tallied as
+// meta.fuse.dnLong for the dry read). Replay: iPhone 630→605 s / 464→459 s, both
+// Android rows byte-identical (scratchpad/replay22/lens.mjs).
+const SERVER_STEP_BLEND_TRIM_MAX_T_S = (() => {
+  const v = Number(process.env.SERVER_STEP_BLEND_TRIM_MAX_T_S);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+})();
 const STEP_LAMBDA_WINSOR   = 0.15;  // per-sample λ pull bound once lamN ≥ 5
 // ── R-225 step FLOOR rung + steps-flat still gate (DRY-RUN by default) ──────
 // 09-Sep same-pocket races 0c7839af / bb5c8cb0 / 08bd47ff: the realme credited
@@ -1680,6 +1695,9 @@ function shadowIngest(st, fx, activity, startedAtMs, userId) {
                               ssGateM: 0, silM: 0, silN: 0,
                               // R-144 blend accumulators + per-fix accuracy sums
                               accSum: 0, accN: 0, blendUpM: 0, blendDnM: 0, blendN: 0,
+                              // R-351: down-trims that landed on long (pedometer-cadence) segments —
+                              // skipped when SERVER_STEP_BLEND_TRIM_MAX_T_S is set, tallied always
+                              blendDnLongM: 0, blendDnLongN: 0,
                               // R-310 coverage guard tallies (dry and live)
                               seenTs: 0, fxFull: false, cvN: 0, cvM: 0, cvBlendM: 0, cvCalN: 0, cvLogN: 0,
                               cvWhy: { spent: 0, over: 0, overL: 0, burst: 0 }, flLeakM: 0,
@@ -2198,6 +2216,12 @@ function shadowSxSegment(sh, dS, T, snap, userId) {
   } else if (adj < -0.5 && sh.lamN >= STEP_CLEAN_FOR_CAL) {
     // Trims only under a confident λ — an uncalibrated stride must never
     // subtract metres GPS actually measured.
+    // R-351: a segment longer than the gate is a pedometer-cadence segment
+    // (iOS ~21 s) whose step delta cannot be trusted against its GPS credit —
+    // tally it; score it only while the gate is unset.
+    const longSeg = T > 10 && (SERVER_STEP_BLEND_TRIM_MAX_T_S === 0 || T > SERVER_STEP_BLEND_TRIM_MAX_T_S);
+    if (longSeg) { sh.blendDnLongM += -adj; sh.blendDnLongN++; }
+    if (SERVER_STEP_BLEND_TRIM_MAX_T_S > 0 && T > SERVER_STEP_BLEND_TRIM_MAX_T_S) return;
     sh.blendDnM += -adj; sh.blendN++;
   }
 }
@@ -2374,6 +2398,7 @@ function authoritativeDistance(roomId, room, st, userId, claimed, nowTs) {
         (sh && sh.starvM ? ` starv=${Math.round(sh.starvM)}/${sh.starvN}${SERVER_STARVATION_LADDER ? '(live)' : '(dry)'}` : '') +
         (sh && sh.stepM ? ` step=${Math.round(sh.stepM)}/${sh.stepN} lam=${sh.lambda.toFixed(2)}/${sh.lamN}${SERVER_STEP_FUSION ? '(live)' : '(dry)'}` : '') +
         (sh && (sh.blendUpM || sh.blendDnM) ? ` blend=+${Math.round(sh.blendUpM)}/-${Math.round(sh.blendDnM)}${SERVER_STEP_BLEND ? '(live)' : '(dry)'}` : '') +
+        (sh && sh.blendDnLongN ? ` trimT=${Math.round(sh.blendDnLongM)}/${sh.blendDnLongN}${SERVER_STEP_BLEND_TRIM_MAX_T_S ? '(skip)' : '(dry)'}` : '') +
         (sh && sh.cvN ? ` cover=${Math.round(sh.cvM)}/${Math.round(sh.cvBlendM)}/${sh.cvN}${SERVER_STEP_COVER_GUARD ? '(live)' : '(dry)'}` : '') +
         (st.r2Bound ? ` r2hold=${st.r2HeldM}/${st.r2Bound}${R168_RUNG2_GAP_BOUND ? '(live)' : '(off)'}` : '') +
         (st.r2Cap ? ` r2cap=${st.r2CapHeldM}/${st.r2Cap}${SERVER_CREDIT_SCORE_CAPS ? '(live)' : '(dry)'}` : '') +
@@ -2612,6 +2637,9 @@ function flushShadow(roomId, room, via) {
                       // whose GPS matched its steps all race.
                       up: Math.round(sh.blendUpM), dn: Math.round(sh.blendDnM),
                       bn: sh.blendN, blive: SERVER_STEP_BLEND,
+                      // R-351: down-trim metres on long (pedometer-cadence) segments; tlive =
+                      // the gate in seconds (0 = they scored above, >0 = they were skipped)
+                      dnLong: Math.round(sh.blendDnLongM), dnLongN: sh.blendDnLongN, tlive: SERVER_STEP_BLEND_TRIM_MAX_T_S,
                       // R-310 coverage guard: segments whose ingest-order diff
                       // did not describe their span — carry metres (m) and
                       // signed blend metres (bm) that were (live) / would be
