@@ -2883,6 +2883,15 @@ function scheduleTerminalSettle(roomId, room, reason) {
 // (no stats, membership row retained, advisory-locked, stands down on a settled
 // room or an existing finish). Guarded by a DB last_distance_m re-read so a
 // racer alive on the Supabase fallback is never evicted — their timer resets.
+// 4-Oct race 733279: the DNF row's distance is the relay's own scored credit.
+// room_members.last_distance_m is the client-written HUD mirror (A-08) — a phone
+// over-counting GPS wrote target there and its eviction row read 500/500, which the
+// results screen showed as WINNER. The mirror is used only when this relay holds no
+// credit for the racer at all (restart before the first frame).
+function evictDistanceM(st, dbDist) {
+  const srvM = Math.max(st.lastDist || 0, st.baselineDist || 0);
+  return srvM > 0 ? srvM : Math.max(dbDist || 0, 0);
+}
 async function evictRacer(roomId, room, userId, reason) {
   if (room.terminal) return;
   if (!supabase) {
@@ -2892,7 +2901,7 @@ async function evictRacer(roomId, room, userId, reason) {
     const st = room.racers.get(userId);
     if (!st || st.evicted || st.finished || st.quit) return;
     st.evicted = true; st.evictReason = reason; st.evictedAt = Date.now();
-    const dist = Math.max(room.gps.get(userId)?.distance_m || 0, st.lastDist || 0);
+    const dist = evictDistanceM(st, 0);
     log(`EVICT room=${roomId} user=${userId} reason=${reason} dist=${Math.round(dist)} time=0 absent_ms=0 test_mode`);
     let victimWs = null;
     for (const c of room.clients) if (c.userId === userId) victimWs = c;
@@ -2969,7 +2978,7 @@ async function evictRacer(roomId, room, userId, reason) {
     }
     const timeMs = room.meta.startedAt
       ? Math.max(0, Date.now() - new Date(room.meta.startedAt).getTime()) : 0;
-    const dist = Math.max(dbDist, room.gps.get(userId)?.distance_m || 0, st.lastDist || 0);
+    const dist = evictDistanceM(st, dbDist);
     const { data: verdict, error } = await supabase.rpc('evict_racer_dnf', {
       p_room_id: roomId, p_user_id: userId, p_distance_m: Math.round(dist),
       p_time_ms: timeMs, p_reason: reason,
@@ -3261,15 +3270,8 @@ function progressFloorSweep(roomId, room, uid, st, now) {
       return;
     }
     st.progSuspLogged = false;
-    if (SERVER_PROGRESS_FLOOR_AUTH) {
-      const budgetGain = (st.acceptedDist || 0) - (st.progWarnBudgetBase || 0);
-      if (budgetGain >= st.progNeedM && (st.progAuthHolds || 0) < PROGRESS_AUTH_MAX_HOLDS) {
-        st.progAuthHolds = (st.progAuthHolds || 0) + 1;
-        st.progWarnDeadline = now + PROGRESS_WARN_MS;
-        log(`PROGRESS-AUTH-HOLD room=${roomId} user=${uid} budget_gain=${Math.round(budgetGain)} auth_gain=${Math.round(gainedSinceWarn)} need=${st.progNeedM} hold=${st.progAuthHolds}/${PROGRESS_AUTH_MAX_HOLDS}`);
-        return;
-      }
-    }
+    // Owner 10-Oct: no auth holds. GPS must show the movement inside the window;
+    // a step-only budget gain does not buy more time. Countdown 0 = evicted.
     st.progWarnDeadline = 0;
     evictRacer(roomId, room, uid, 'progress_timeout');
   }
