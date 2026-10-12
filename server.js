@@ -984,6 +984,16 @@ const SHADOW_PERSIST_FIXES   = true;
 const SHADOW_NIS_SAMPLE_MAX  = 3000;   // bounded like the client's census sampling
 
 const RACER_GONE_EVICT_MS   = 10 * 60 * 1000;
+// R-440 (owner 12-Oct): a racer who drops off with no distance at all is gone,
+// not out of signal — Guest7746 left 73 s in at 0 m and held the room for 10 min.
+// Anyone the relay has credited RACER_GONE_ZERO_DIST_M or more keeps the full
+// 10 min (signal loss mid-race). The fallback-progress stand-down in evictRacer
+// still runs first, so a racer alive over Supabase restarts the clock instead.
+const RACER_GONE_ZERO_EVICT_MS = 2 * 60 * 1000;
+const RACER_GONE_ZERO_DIST_M   = 10;
+const goneEvictMs = (st) =>
+  Math.max(evictDistanceM(st, 0), st.fallbackDbM || 0) < RACER_GONE_ZERO_DIST_M
+    ? RACER_GONE_ZERO_EVICT_MS : RACER_GONE_EVICT_MS;
 const STATIONARY_EVICT_MS   = 10 * 60 * 1000;
 const STATIONARY_WARN_MS    = 60 * 1000;
 // ── Progress floor (owner policy 2026-09-03, anti-chatroom) ──────────────────
@@ -2976,8 +2986,13 @@ async function evictRacer(roomId, room, userId, reason) {
       if (!r || r.status !== 'racing') return;              // settled — terminal flow owns everyone
       room.meta = { startedAt: r.started_at, targetM: r.target_distance_m };
     }
+    // R-439 (owner 12-Oct): an absent racer's time is their LAST CONTACT, not the
+    // moment the sweep evicts them — Guest7746 left at 73 s and got a 679 s DNF.
+    // st.disconnectedAt is the socket drop, or the last fallback-progress
+    // stand-down (which restarts it), so it is the latest proof of life.
+    const endAt = reason === 'disconnect_timeout' && st.disconnectedAt ? st.disconnectedAt : Date.now();
     const timeMs = room.meta.startedAt
-      ? Math.max(0, Date.now() - new Date(room.meta.startedAt).getTime()) : 0;
+      ? Math.max(0, endAt - new Date(room.meta.startedAt).getTime()) : 0;
     const dist = evictDistanceM(st, dbDist);
     const { data: verdict, error } = await supabase.rpc('evict_racer_dnf', {
       p_room_id: roomId, p_user_id: userId, p_distance_m: Math.round(dist),
@@ -3018,7 +3033,10 @@ async function evictRacer(roomId, room, userId, reason) {
     let victimWs = null;
     for (const c of room.clients) if (c.userId === userId) victimWs = c;
     broadcast(room, { event: 'racer_quit', payload: { user_id: userId, evicted: true } }, victimWs);
-    if (victimWs) send(victimWs, { event: 'evicted', payload: { user_id: userId, reason } });
+    // R-440: gone_ms lets the client say how long the relay waited (2 or 10 min);
+    // kept on st for the reconnect path below.
+    st.evictGoneMs = absentMs;
+    if (victimWs) send(victimWs, { event: 'evicted', payload: { user_id: userId, reason, gone_ms: absentMs } });
     scheduleCompletionCheck(roomId, room);
   } catch (e) { log('EVICT error', roomId, userId, e && e.message); }
   finally { st.evicting = false; }
@@ -3855,7 +3873,7 @@ wss.on('connection', async (ws, req) => {
       // Emitted here rather than in applyEvicted because only the server knows
       // both timestamps. Absent evictedAt (pre-upgrade state) logs nothing.
       if (st.evictedAt) log(`EVICT-RECONNECT room=${roomId} user=${userId} reason=${st.evictReason || '?'} after_ms=${Date.now() - st.evictedAt} src=memory`);
-      send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout' } });
+      send(ws, { event: 'evicted', payload: { user_id: userId, reason: st.evictReason || 'disconnect_timeout', gone_ms: st.evictGoneMs } });
     }
   }
 
@@ -4516,9 +4534,9 @@ function roomLevelSweep(roomId, room, now) {
 function perRacerSweep(roomId, room, now) {
   for (const [uid, st] of room.racers) {
     if (st.finished || st.quit || st.evicted || st.evicting) continue;
-    // REQ1: 10 min of continuous transport absence → evict. No warning exists
-    // on this path by design — there is no socket to warn (C2).
-    if (st.disconnectedAt && now - st.disconnectedAt >= RACER_GONE_EVICT_MS) {
+    // REQ1: 10 min of continuous transport absence → evict (2 min at ~0 m, R-440).
+    // No warning exists on this path by design — there is no socket to warn (C2).
+    if (st.disconnectedAt && now - st.disconnectedAt >= goneEvictMs(st)) {
       evictRacer(roomId, room, uid, 'disconnect_timeout');
       continue;
     }
