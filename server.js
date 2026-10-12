@@ -820,7 +820,8 @@ const BOOT_TS                  = Date.now();
 // lines say where it WOULD bind; scoring byte-identical. The binding of the
 // wall ceiling itself is still SERVER_CREDIT_WALL_BOUND (flip both).
 const SERVER_CREDIT_SCORE_CAPS = process.env.SERVER_CREDIT_SCORE_CAPS === '1';
-const SERVER_CREDIT_SCORE_CAPS_MPS = { running: 7, walking: 3, cycling: 17, swimming: 3 };
+// R-323 (owner 12-Oct): walking 3 → 4.2 m/s (15 km/h) — 3 m/s sat below elite race-walking (~4 m/s).
+const SERVER_CREDIT_SCORE_CAPS_MPS = { running: 7, walking: 4.2, cycling: 17, swimming: 3 };
 const SERVER_CREDIT_SCORE_CAP_UNKNOWN_MPS = 7;
 const R168_RUNG2_MAX_GAP_S     = 120;
 // A-07 (3): fix timestamps are client-supplied and were never compared with
@@ -2902,6 +2903,19 @@ function evictDistanceM(st, dbDist) {
   const srvM = Math.max(st.lastDist || 0, st.baselineDist || 0);
   return srvM > 0 ? srvM : Math.max(dbDist || 0, 0);
 }
+// R-348 (owner 12-Oct): A-26's "live elsewhere" test read ANY server_cred_at newer
+// than the drop as the other relay's — but persistCreditsOnce here keeps writing
+// until the racer is resolved, and one last write lands 2-7 s after disconnectedAt.
+// evictRacer then stood down at 10 min on its own stamp, restarted the clock to
+// +20 min, and the empty room was GC'd at 15 min: never evicted, room left
+// 'racing'. A stamp counts as elsewhere only when it is also newer than the last
+// one THIS relay wrote (st.ownCredAt, same ms as the ISO string sent). Unset
+// after a restart → 0 → exactly the pre-R-348 test. Shared by evictRacer and
+// maybeCompleteRace's gone-window; credAtMs is the parsed DB value (0 = none).
+function credWrittenElsewhere(credAtMs, st) {
+  if (!credAtMs || !st || !st.disconnectedAt) return false;
+  return credAtMs > st.disconnectedAt && credAtMs > (st.ownCredAt || 0);
+}
 async function evictRacer(roomId, room, userId, reason) {
   if (room.terminal) return;
   if (!supabase) {
@@ -2934,7 +2948,7 @@ async function evictRacer(roomId, room, userId, reason) {
     // against them here (the stand-down below covers the client mirror).
     if (m && m.server_cred_at && st.disconnectedAt) {
       const credAt = new Date(m.server_cred_at).getTime();
-      if (credAt > st.disconnectedAt && credAt > (st.credElsewhereAt || 0)) {
+      if (credWrittenElsewhere(credAt, st) && credAt > (st.credElsewhereAt || 0)) {   // R-348: not our own stamp
         log(`EVICT stand-down (live elsewhere) room=${roomId} user=${userId} cred_at=${m.server_cred_at} reason=${reason}${SERVER_GONE_LIVENESS_CHECK ? '' : ' (dry)'}`);
         if (SERVER_GONE_LIVENESS_CHECK) {
           st.credElsewhereAt = credAt;
@@ -3561,7 +3575,7 @@ async function maybeCompleteRace(roomId, room) {
       // advanced past what this socket last saw, means they are still racing.
       const credAt = server_cred_at ? new Date(server_cred_at).getTime() : 0;
       const mirrorMoved = (last_distance_m || 0) > (st.lastDist || 0) + EVICT_PROGRESS_EPS_M;
-      if (credAt > st.disconnectedAt || mirrorMoved) {
+      if (credWrittenElsewhere(credAt, st) || mirrorMoved) {   // R-348: our own last write is not "elsewhere"
         if (!st.goneLiveLogTs || now - st.goneLiveLogTs >= 60000) {
           st.goneLiveLogTs = now;
           log(`GONE-LIVE-ELSEWHERE room=${roomId} user=${user_id} gone=${Math.round((now - st.disconnectedAt) / 1000)}s ` +
@@ -4401,6 +4415,10 @@ function persistCreditsOnce(via) {
       const metaRow = { n: st.authN || 0, r1: st.authR1 || 0, seed: Math.round(sh.seedM || 0),
                         cred: Math.round(sh.credM || 0), raw: Math.round(sh.rawM || 0),
                         boot: BOOT_TS, ts: now, via };
+      // R-348: remember the exact stamp this relay sends (ms, as the ISO string
+      // round-trips) so the A-26 liveness tests never read it as another relay's.
+      // Set at issue, not on success: a write in flight can land before its .then.
+      st.ownCredAt = Math.max(st.ownCredAt || 0, now);
       pending.push(supabase.from('room_members')
         .update({ server_cred_m: authM, server_cred_at: new Date(now).toISOString(), server_cred_meta: metaRow })
         .eq('room_id', roomId).eq('user_id', uid).eq('role', 'racer')
